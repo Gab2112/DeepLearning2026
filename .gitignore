@@ -1,1 +1,32 @@
+# macOS
 __MACOSX/
+.DS_Store
+
+# Python virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+.idea/
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch checkpoints & weights
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+
+# Logs & Experiment Tracking
+runs/
+lightning_logs/
+wandb/
+
+# Jupyter
+.ipynb_checkpoints/
+
+
