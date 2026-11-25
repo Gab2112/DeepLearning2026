@@ -1,0 +1,48 @@
+# =====================================================================
+# CONFIGURAZIONE GENERALE PROGETTO DEEP LEARNING: VEGETATION FORECASTING
+# =====================================================================
+
+paths:
+  # Percorsi relativi alla radice del progetto
+  train_data_dir: "DATA/train_multi_output_clear_sky"
+  val_id_data_dir: "DATA/val_chopped_multi_output_clear_sky"
+  ood_s_data_dir: "DATA/ood-s_chopped_multi_output_clear_sky"
+  ood_t_data_dir: "DATA/ood-t_chopped_multi_output_clear_sky"
+  scaler_path: "DATA/train_multi_output_clear_sky/scaler.json"
+  checkpoints_dir: "checkpoints"
+  results_dir: "results"
+
+data:
+  seed: 42
+  # Partizionamento per Tile nello split di train (per evitare data leakage)
+  num_train_tiles: 70     # Numero di tile geografici per il train dell'imputer (su 84 totali)
+  num_val_tiles: 14     # Numero di tile geografici tenuti da parte per validazione
+  climate_dropout_p: 0.35 # Probabilità di sostituire il clima noto con <UNKNOWN> durante il training
+
+# ---------------------------------------------------------------------
+# Modello di Imputazione del Passato (Bi-GRU Imputer)
+# ---------------------------------------------------------------------
+imputer_model:
+  input_dim: 27           # 18 meteo/DOY + 3 target sparsi + 3 maschere + 3 orbita/tempo
+  climate_dim: 8          # Dimensione dell'embedding per le classi climatiche di Köppen
+  hidden_dim: 64
+  num_layers: 2
+  output_dim: 3           # NDVI, GNDVI, EVI giornalieri
+  dropout: 0.1
+
+imputer_training:
+  epochs: 10
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  smoothness_weight: 0.05 # Peso della regolarizzazione temporale per evitare salti discontinui
+  checkpoint_name: "history_imputer_best.pt"
+
+# ---------------------------------------------------------------------
+# Modello di Forecasting Futuro (Predizione multi-step e probabilistica)
+# ---------------------------------------------------------------------
+forecasting:
+  target_names: ["NDVI", "GNDVI", "EVI"]
+  future_steps: 3
+  quantiles: [0.1, 0.5, 0.9]
+  horizon_days_avg: 14
