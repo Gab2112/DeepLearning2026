@@ -11,7 +11,6 @@ missing value structures, and spatial-temporal split relationships.
 import sys
 from pathlib import Path
 import json
-import glob
 from collections import Counter
 
 import numpy as np
@@ -29,7 +28,7 @@ try:
 except ImportError:
     SCIPY_AVAILABLE = False
 
-DATA_DIR = Path("DATA")
+DATA_DIR = Path("../../DATA")
 
 
 def print_header(title):
