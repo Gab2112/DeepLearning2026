@@ -1,5 +1,5 @@
 """
-Training and Validation Pipeline for the Past Time-Series Imputer.
+Training and Validation Pipeline for the Bi-GRU Past Time-Series Imputer.
 Configured centrally via configs/config.yaml.
 Executes:
 1. Spatial Tile-based Train/Val splitting.
@@ -28,11 +28,11 @@ from src.utils.config import load_config
 from src.data.transforms import ArcsinhScaler
 from src.data.splits import get_train_val_tile_split
 from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
-from src.data.bigru_imputer import compute_masked_loss
+from src.models.bigru_imputer import compute_masked_loss
 from src.models.history_imputer import BiGRUHistoryImputer
 
 
-def train_imputer(
+def train_bigru_imputer(
     config_path: Union[str, Path] = "configs/config.yaml",
     device: Optional[str] = None,
 ):
@@ -275,5 +275,8 @@ def demonstrate_imputation(model, dataset, scaler, device):
     print("-" * 84)
 
 
+train_imputer = train_bigru_imputer
+
+
 if __name__ == "__main__":
-    train_imputer()
+    train_bigru_imputer()

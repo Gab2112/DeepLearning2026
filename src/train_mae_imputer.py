@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from src.data.bigru_imputer import compute_masked_loss
+from src.models.bigru_imputer import compute_masked_loss
 from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
 from src.data.splits import get_train_val_tile_split
 from src.data.transforms import ArcsinhScaler

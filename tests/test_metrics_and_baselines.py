@@ -205,7 +205,7 @@ def test_import_order_no_circular_imports():
         "from src.models.history_imputer import BiGRUHistoryImputer",
         "from src.metrics import evaluate_forecast",
         "import src.data",
-        "from src.data.bigru_imputer import BiGRUHistoryImputer",
+        "from src.models.bigru_imputer import BiGRUHistoryImputer",
     ]
     for stmt in statements:
         proc = subprocess.run(

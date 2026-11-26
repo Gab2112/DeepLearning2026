@@ -466,7 +466,7 @@ class ModelInterpolator(BaseInterpolator):
             linear = LinearInterpolator(clip_min=self.clip_min, clip_max=self.clip_max)
             return linear.interpolate(h_raw, mask=m_raw, columns=[18, 19, 20])
 
-        from src.data.bigru_imputer import build_imputer_features
+        from src.models.bigru_imputer import build_imputer_features
         from src.data.climate import encode_climate
 
         model_input = build_imputer_features(h_raw, m_raw, self.scaler)
@@ -507,7 +507,7 @@ class ModelInterpolator(BaseInterpolator):
                 for h, m in zip(histories, masks)
             ]
 
-        from src.data.bigru_imputer import impute_batch_sequences
+        from src.models.bigru_imputer import impute_batch_sequences
 
         return impute_batch_sequences(
             histories=histories,

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Unified module for the Bi-GRU History Imputer.
 Contains all components, utilities, and functions needed to train, load,
@@ -35,8 +37,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.transforms import ArcsinhScaler
-from src.data.climate import encode_climate, NUM_CLIMATES
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from src.data.transforms import ArcsinhScaler
+
 from src.models.history_imputer import BiGRUHistoryImputer
 
 
@@ -188,9 +192,11 @@ def impute_sequence(
         model, _ = load_imputer_checkpoint(device=device)
 
     if scaler is None:
+        from src.data.transforms import ArcsinhScaler
         scaler = ArcsinhScaler(_resolve_project_path("DATA/train_multi_output_clear_sky/scaler.json"))
 
     # Build features
+    from src.data.climate import encode_climate
     features = build_imputer_features(h_raw, m_raw, scaler)
     climate_id = encode_climate(climate_str)
 
@@ -250,6 +256,7 @@ def impute_batch_sequences(
         pad_mask = torch.zeros(B, max_l, dtype=torch.bool)
         c_ids = torch.zeros(B, dtype=torch.long)
 
+        from src.data.climate import encode_climate
         for i in range(B):
             L = lengths[i]
             x_padded[i, :L] = torch.from_numpy(feats[i])
@@ -352,6 +359,7 @@ def evaluate_imputer_on_sample(
     errors = {"NDVI": [], "GNDVI": [], "EVI": []}
     target_names = ["NDVI", "GNDVI", "EVI"]
 
+    from src.data.climate import encode_climate
     for drop_idx in valid_indices:
         perturbed_mask = obs_mask.copy()
         perturbed_mask[drop_idx] = False
@@ -416,11 +424,14 @@ def train_imputer(
     device: Optional[str] = None,
 ):
     """
-    Delegates to the canonical training pipeline in src.train_imputer.
+    Delegates to the canonical training pipeline in src.train_bigru_imputer.
     """
-    from src.train_imputer import train_imputer as _train_imputer
+    from src.train_bigru_imputer import train_bigru_imputer as _train_bigru_imputer
 
-    return _train_imputer(config_path=config_path, device=device)
+    return _train_bigru_imputer(config_path=config_path, device=device)
+
+
+train_bigru_imputer = train_imputer
 
 
 # =====================================================================
@@ -442,10 +453,11 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if args.mode == "train":
-        train_imputer(args.config, device=device)
+        train_bigru_imputer(args.config, device=device)
         return
 
     # For test and evaluate, load sample data
+    from src.data.transforms import ArcsinhScaler
     scaler = ArcsinhScaler(args.scaler)
     model, _ = load_imputer_checkpoint(args.checkpoint, device=device)
 

@@ -1,6 +1,6 @@
 """
 Inference, checkpoint loading, and evaluation utilities for the MAE History Imputer.
-Reuses feature construction and loss utilities from src.data.bigru_imputer.
+Reuses feature construction and loss utilities from src.models.bigru_imputer.
 """
 
 import pathlib
@@ -23,7 +23,7 @@ def _resolve_project_path(path: Union[str, Path]) -> Path:
     return p if p.is_absolute() else PROJECT_ROOT / p
 
 
-from src.data.bigru_imputer import (
+from src.models.bigru_imputer import (
     build_imputer_features,
     compute_imputation_metrics,
     compute_masked_loss,
