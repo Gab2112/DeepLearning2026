@@ -12,7 +12,7 @@ from torch.utils.data import Dataset
 
 from src.data.transforms import ArcsinhScaler
 from src.data.climate import encode_climate, NUM_CLIMATES
-from src.data.interpolation import InterpolationFactory, BaseInterpolator, ModelInterpolator
+from src.data.interpolation import InterpolationFactory, BaseInterpolator, LinearInterpolator, ModelInterpolator
 
 
 class VegetationDataset(Dataset):
@@ -31,21 +31,31 @@ class VegetationDataset(Dataset):
         interpolation_strategy: Union[str, BaseInterpolator] = "linear",
         interpolation_columns: Sequence[int] = (18, 19, 20),
         interpolate_weather: bool = True,
+        interpolation_kwargs: Optional[Dict] = None,
+        precompute_model_imputation: bool = True,
+        imputation_batch_size: int = 128,
         climate_dropout_p: float = 0.0,
         seed: int = 42,
     ):
         super().__init__()
         self.scaler = scaler
-        self.interpolation_columns = interpolation_columns
+        self.interpolation_columns = list(interpolation_columns)
         self.interpolate_weather = interpolate_weather
+        self.precompute_model_imputation = precompute_model_imputation
+        self.imputation_batch_size = imputation_batch_size
         self.climate_dropout_p = climate_dropout_p
         self.rng = np.random.RandomState(seed)
 
         # Build interpolator from factory
         if interpolation_strategy is not None and str(interpolation_strategy).lower() != "none":
-            self.interpolator = InterpolationFactory.create(interpolation_strategy)
+            self.interpolator = InterpolationFactory.create(
+                interpolation_strategy, **(interpolation_kwargs or {})
+            )
         else:
             self.interpolator = InterpolationFactory.create("none")
+
+        # Dedicated unclipped interpolator for weather columns (0..17)
+        self._weather_interpolator = LinearInterpolator(clip_min=None, clip_max=None)
 
         data_dir = Path(data_dir)
         if file_list is not None:
@@ -62,6 +72,11 @@ class VegetationDataset(Dataset):
         self.samples = []
         self.file_cache: Dict[Path, Dict[str, np.ndarray]] = {}
 
+        use_batch_precompute = (
+            self.precompute_model_imputation
+            and getattr(self.interpolator, "supports_batch_history_imputation", False)
+        )
+
         for fpath in self.files:
             d = np.load(fpath, allow_pickle=True)
             histories = d["history"]
@@ -74,7 +89,7 @@ class VegetationDataset(Dataset):
             fut_noise = d["future_noise"] if "future_noise" in d else None
 
             num_samples = len(histories)
-            self.file_cache[fpath] = {
+            cache_entry = {
                 "history": histories,
                 "history_mask": hist_masks,
                 "future": futures,
@@ -84,6 +99,17 @@ class VegetationDataset(Dataset):
                 "climate": climates,
                 "future_noise": fut_noise,
             }
+
+            if use_batch_precompute and num_samples > 0:
+                imputed_list = self.interpolator.interpolate_history_batch(
+                    list(histories),
+                    list(hist_masks),
+                    [str(c) for c in climates],
+                    batch_size=self.imputation_batch_size,
+                )
+                cache_entry["history_imputed"] = imputed_list
+
+            self.file_cache[fpath] = cache_entry
 
             for s_idx in range(num_samples):
                 self.samples.append((fpath, s_idx))
@@ -105,27 +131,32 @@ class VegetationDataset(Dataset):
         L_h = h_raw.shape[0]
         L_f = f_raw.shape[0]
 
-        # 1. Apply Interpolation Strategy to remove missing values from history
-        if isinstance(self.interpolator, ModelInterpolator):
+        # 1. Apply Interpolation Strategy to remove missing values from history targets
+        if "history_imputed" in cached:
+            h_clean = cached["history_imputed"][s_idx].astype(np.float32).copy()
+        elif isinstance(self.interpolator, ModelInterpolator):
             h_clean = self.interpolator.interpolate_history_sample(h_raw, m_raw, raw_climate)
         else:
-            cols = list(self.interpolation_columns)
-            if self.interpolate_weather:
-                # Also interpolate any occasional missing weather values in 0..17
-                weather_missing_cols = [c for c in range(18) if np.any(m_raw[:, c])]
-                cols = sorted(list(set(cols + weather_missing_cols)))
+            h_clean = self.interpolator.interpolate(
+                h_raw, mask=m_raw, columns=self.interpolation_columns
+            )
 
-            h_clean = self.interpolator.interpolate(h_raw, mask=m_raw, columns=cols)
+        # Interpolate occasional missing weather values in 0..17 without target clipping
+        if self.interpolate_weather:
+            weather_missing_cols = [
+                c for c in range(18) if np.any(m_raw[:, c]) or np.any(np.isnan(h_clean[:, c]))
+            ]
+            if weather_missing_cols:
+                h_clean = self._weather_interpolator.interpolate(
+                    h_clean, mask=m_raw, columns=weather_missing_cols
+                )
 
-        # Fallback safeguard against any remaining NaNs
-        h_clean = np.nan_to_num(h_clean, nan=0.0)
-
-        # 2. Arcsinh Normalization
-        # History weather + targets
+        # 2. Arcsinh Normalization (preserve NaNs through scaler, zero-fill only AFTER scaling)
         norm_h_features = self.scaler.transform_features(h_clean)[:, :18]
+        norm_h_features = np.nan_to_num(norm_h_features, nan=0.0)
         norm_h_targets = self.scaler.transform_targets(h_clean[:, 18:21])
+        norm_h_targets = np.nan_to_num(norm_h_targets, nan=0.0)
         norm_history = np.concatenate([norm_h_features, norm_h_targets], axis=-1)  # (L_h, 21)
-        norm_history = np.nan_to_num(norm_history, nan=0.0)
 
         # Future weather (columns 0..17)
         norm_future_weather = self.scaler.transform_features(f_raw)[:, :18]
@@ -171,6 +202,7 @@ def collate_vegetation_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, 
 
     padded_hist = torch.zeros(batch_size, max_h_len, h_dim, dtype=torch.float32)
     hist_padding_mask = torch.zeros(batch_size, max_h_len, dtype=torch.bool)
+    padded_hist_obs_mask = torch.zeros(batch_size, max_h_len, dtype=torch.bool)
     padded_fut = torch.zeros(batch_size, max_f_len, f_dim, dtype=torch.float32)
     fut_padding_mask = torch.zeros(batch_size, max_f_len, dtype=torch.bool)
 
@@ -184,12 +216,14 @@ def collate_vegetation_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, 
         lf = b["future_length"]
         padded_hist[i, :lh] = b["history"]
         hist_padding_mask[i, :lh] = True
+        padded_hist_obs_mask[i, :lh] = b["history_obs_mask"]
         padded_fut[i, :lf] = b["future_weather"]
         fut_padding_mask[i, :lf] = True
 
     return {
         "history": padded_hist,
         "history_padding_mask": hist_padding_mask,
+        "history_obs_mask": padded_hist_obs_mask,
         "future_weather": padded_fut,
         "future_padding_mask": fut_padding_mask,
         "target": targets,

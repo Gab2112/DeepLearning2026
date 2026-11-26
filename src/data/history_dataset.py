@@ -37,6 +37,7 @@ class HistoryImputationDataset(Dataset):
         climate_dropout_p: float = 0.35,
         interpolation_strategy: Optional[Union[str, BaseInterpolator]] = None,
         interpolation_columns: Optional[Sequence[int]] = (18, 19, 20),
+        interpolation_kwargs: Optional[Dict] = None,
         seed: int = 42,
     ):
         super().__init__()
@@ -47,7 +48,9 @@ class HistoryImputationDataset(Dataset):
         self.rng = np.random.RandomState(seed)
 
         if interpolation_strategy is not None and str(interpolation_strategy).lower() != "none":
-            self.interpolator = InterpolationFactory.create(interpolation_strategy)
+            self.interpolator = InterpolationFactory.create(
+                interpolation_strategy, **(interpolation_kwargs or {})
+            )
         else:
             self.interpolator = None
 
@@ -149,12 +152,28 @@ class HistoryImputationDataset(Dataset):
         else:
             eval_supervision_mask = obs_mask.copy()
 
-        # 3. Handle NaNs in input target / Apply Interpolation Strategy
+        # 3. Climate tokenization & Climate Dropout (computed before optional interpolator)
+        climate_id = encode_climate(raw_climate)
+        effective_climate_str = raw_climate
+        if self.climate_dropout_p > 0.0 and self.rng.rand() < self.climate_dropout_p:
+            climate_id = 0  # Force to <UNKNOWN> to train robustness for OOD-S
+            effective_climate_str = "<UNKNOWN>"
+
+        # 4. Handle NaNs in input target / Apply Interpolation Strategy (never leak masked point)
         if self.interpolator is not None:
+            effective_mask = m_raw.copy()
+            effective_mask[:, 18:21] = ~input_obs_mask[:, None]
+            h_for_interp = h_raw.copy()
+            h_for_interp[~input_obs_mask, 18:21] = np.nan
+
             if isinstance(self.interpolator, ModelInterpolator):
-                h_interp = self.interpolator.interpolate_history_sample(h_raw, m_raw, raw_climate)
+                h_interp = self.interpolator.interpolate_history_sample(
+                    h_for_interp, effective_mask, effective_climate_str
+                )
             else:
-                h_interp = self.interpolator.interpolate(h_raw, mask=m_raw, columns=self.interpolation_columns)
+                h_interp = self.interpolator.interpolate(
+                    h_for_interp, mask=effective_mask, columns=self.interpolation_columns
+                )
             input_targets = self.scaler.transform_targets(h_interp[:, 18:21])
             input_targets = np.nan_to_num(input_targets, nan=0.0)
         else:
@@ -166,7 +185,7 @@ class HistoryImputationDataset(Dataset):
         mask_feature = np.zeros((L, 3), dtype=np.float32)
         mask_feature[input_obs_mask] = 1.0
 
-        # 4. Sentinel-2 5-day Orbital dynamics features
+        # 5. Sentinel-2 5-day Orbital dynamics features
         delta_t, orbital_phase, missed_revisits = self._compute_orbital_dynamics(input_obs_mask)
         orbital_feats = np.stack([delta_t, orbital_phase, missed_revisits], axis=-1)  # (L, 3)
 
@@ -174,11 +193,6 @@ class HistoryImputationDataset(Dataset):
         # [weather_calendar (18), input_targets (3), mask_feature (3), orbital_feats (3)] -> total 27 dims
         model_input = np.concatenate([norm_weather_calendar, input_targets, mask_feature, orbital_feats], axis=-1)
         model_input = np.nan_to_num(model_input, nan=0.0)
-
-        # 5. Climate tokenization & Climate Dropout
-        climate_id = encode_climate(raw_climate)
-        if self.climate_dropout_p > 0.0 and self.rng.rand() < self.climate_dropout_p:
-            climate_id = 0  # Force to <UNKNOWN> to train robustness for OOD-S
 
         clean_norm_targets = np.nan_to_num(norm_targets, nan=0.0)
 

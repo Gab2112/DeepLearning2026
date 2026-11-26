@@ -26,37 +26,10 @@ import numpy as np
 
 from src.utils.config import load_config
 from src.data.transforms import ArcsinhScaler
+from src.data.splits import get_train_val_tile_split
 from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
+from src.data.bigru_imputer import compute_masked_loss
 from src.models.history_imputer import BiGRUHistoryImputer
-
-
-def compute_masked_loss(
-    preds: torch.Tensor,
-    targets: torch.Tensor,
-    loss_mask: torch.Tensor,
-    padding_mask: torch.Tensor,
-    smoothness_weight: float = 0.05,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Computes masked L1 reconstruction loss on supervised points plus temporal smoothness.
-    """
-    if loss_mask.sum() > 0:
-        p_masked = preds[loss_mask]
-        t_masked = targets[loss_mask]
-        recon_loss = nn.functional.smooth_l1_loss(p_masked, t_masked, reduction="mean")
-    else:
-        recon_loss = torch.tensor(0.0, device=preds.device)
-
-    # Temporal Smoothness Regularization
-    diff = preds[:, 1:, :] - preds[:, :-1, :]
-    valid_diff_mask = (padding_mask[:, 1:] & padding_mask[:, :-1]).unsqueeze(-1).expand_as(diff)
-    if valid_diff_mask.sum() > 0:
-        smooth_loss = torch.mean(diff[valid_diff_mask] ** 2)
-    else:
-        smooth_loss = torch.tensor(0.0, device=preds.device)
-
-    total_loss = recon_loss + smoothness_weight * smooth_loss
-    return total_loss, recon_loss
 
 
 def train_imputer(
@@ -98,7 +71,7 @@ def train_imputer(
     print(f"[*] Data Directory   : {data_dir}")
     print(f"[*] Checkpoint Target: {save_path}")
 
-    # 2. Tile Partitioning (Split geografico disgiunto per evitare leakage)
+    # 2. Tile Partitioning (Split geografico disgiunto e stratificato per clima)
     all_files = sorted(list(data_dir.glob("*.npz")))
     if len(all_files) == 0:
         raise FileNotFoundError(f"Nessun file .npz trovato nella cartella:\n  {data_dir.resolve()}")
@@ -110,9 +83,14 @@ def train_imputer(
             f"(train={num_train_tiles}, val={num_val_tiles})."
         )
 
-    train_files = all_files[:num_train_tiles]
-    val_files = all_files[num_train_tiles : required_tiles]
+    train_files, val_files, split_summary = get_train_val_tile_split(
+        data_dir, num_val_tiles=num_val_tiles, seed=seed
+    )
+    if num_train_tiles < len(train_files):
+        train_files = train_files[:num_train_tiles]
     print(f"[*] Train Tiles: {len(train_files)} | Val Tiles: {len(val_files)} (su {len(all_files)} totali)")
+    print(f"[*] Climi Train: {split_summary['train']}")
+    print(f"[*] Climi Val  : {split_summary['val']}")
 
     # 3. Scaler
     scaler = ArcsinhScaler(scaler_path)

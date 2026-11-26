@@ -18,6 +18,8 @@ class BaseInterpolator(ABC):
     Operates on 1D series (L,) or 2D sequences (L, D).
     """
 
+    supports_batch_history_imputation: bool = False
+
     def __init__(
         self,
         clip_min: Optional[float] = None,
@@ -368,6 +370,8 @@ class ModelInterpolator(BaseInterpolator):
     Requires checkpoint path and scaler to perform end-to-end continuous imputation.
     """
 
+    supports_batch_history_imputation: bool = True
+
     def __init__(
         self,
         checkpoint_path: Union[str, Path] = "checkpoints/history_imputer_best.pt",
@@ -435,55 +439,23 @@ class ModelInterpolator(BaseInterpolator):
     ) -> np.ndarray:
         """
         Imputes missing past target values in a full history sample (L, 21) using the trained Bi-GRU.
-        Replaces targets in columns 18..20 where missing.
+        Replaces targets in columns 18..20 where missing without modifying weather columns (0..17).
         """
         if self.model is None or self.scaler is None:
             # Fallback to linear if model or scaler checkpoint is unavailable
             linear = LinearInterpolator(clip_min=self.clip_min, clip_max=self.clip_max)
             return linear.interpolate(h_raw, mask=m_raw, columns=[18, 19, 20])
 
-        L = h_raw.shape[0]
-        norm_weather = self.scaler.transform_features(h_raw)[:, :18]
-        norm_weather = np.nan_to_num(norm_weather, nan=0.0)
-
-        targets_raw = h_raw[:, 18:21]
-        norm_targets = self.scaler.transform_targets(targets_raw)
-
-        obs_mask = ~m_raw[:, 18]
-        input_targets = norm_targets.copy()
-        input_targets[~obs_mask] = 0.0
-        input_targets = np.nan_to_num(input_targets, nan=0.0)
-
-        mask_feature = np.zeros((L, 3), dtype=np.float32)
-        mask_feature[obs_mask] = 1.0
-
-        # Orbital dynamics
-        delta_t = np.zeros(L, dtype=np.float32)
-        orbital_phase = np.zeros(L, dtype=np.float32)
-        missed_revisits = np.zeros(L, dtype=np.float32)
-        last_obs = 0.0
-        has_seen = False
-        for t in range(L):
-            orbital_phase[t] = (t % 5) / 5.0
-            if obs_mask[t]:
-                last_obs = float(t)
-                has_seen = True
-            else:
-                if has_seen:
-                    elapsed = float(t) - last_obs
-                    delta_t[t] = elapsed
-                    missed_revisits[t] = float(np.floor(elapsed / 5.0))
-
-        orbital_feats = np.stack([delta_t, orbital_phase, missed_revisits], axis=-1)
-        model_input = np.concatenate([norm_weather, input_targets, mask_feature, orbital_feats], axis=-1)
-        model_input = np.nan_to_num(model_input, nan=0.0)
-
+        from src.data.bigru_imputer import build_imputer_features
         from src.data.climate import encode_climate
+
+        model_input = build_imputer_features(h_raw, m_raw, self.scaler)
         climate_id = encode_climate(climate_str)
 
         x_t = torch.from_numpy(model_input).float().unsqueeze(0).to(self.device)
         c_t = torch.tensor([climate_id], dtype=torch.long, device=self.device)
 
+        self.model.eval()
         with torch.no_grad():
             preds_norm = self.model(x_t, climate_id=c_t).squeeze(0).cpu().numpy()
 
@@ -494,4 +466,37 @@ class ModelInterpolator(BaseInterpolator):
             col_missing = m_raw[:, col]
             out[col_missing, col] = preds_orig[col_missing, idx]
 
-        return self._apply_clip(out)
+        out[:, 18:21] = self._apply_clip(out[:, 18:21])
+        return out
+
+    def interpolate_history_batch(
+        self,
+        histories: List[np.ndarray],
+        masks: List[np.ndarray],
+        climates: List[str],
+        batch_size: int = 128,
+    ) -> List[np.ndarray]:
+        """
+        Batched imputation for a list of history samples (L_i, 21).
+        Only modifies target columns 18..20 and leaves weather columns 0..17 untouched.
+        """
+        if self.model is None or self.scaler is None:
+            linear = LinearInterpolator(clip_min=self.clip_min, clip_max=self.clip_max)
+            return [
+                linear.interpolate(h, mask=m, columns=[18, 19, 20])
+                for h, m in zip(histories, masks)
+            ]
+
+        from src.data.bigru_imputer import impute_batch_sequences
+
+        return impute_batch_sequences(
+            histories=histories,
+            masks=masks,
+            climates=climates,
+            model=self.model,
+            scaler=self.scaler,
+            device=self.device,
+            batch_size=batch_size,
+            clip_min=self.clip_min,
+            clip_max=self.clip_max,
+        )

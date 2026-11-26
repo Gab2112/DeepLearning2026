@@ -24,7 +24,6 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 
 # Cross-Python compatibility shim for pathlib unpickling (Python 3.13 / 3.14)
 import pathlib
@@ -38,94 +37,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.data.transforms import ArcsinhScaler
 from src.data.climate import encode_climate, NUM_CLIMATES
-from src.utils.config import load_config
-
-
-# =====================================================================
-# 1. NEURAL ARCHITECTURE
-# =====================================================================
-
-class BiGRUHistoryImputer(nn.Module):
-    """
-    Bidirectional GRU for imputing and densifying sparse satellite target time series.
-    Inputs (27 dims):
-        - 18 weather & Fourier calendar features
-        - 3 sparse normalized target values (NDVI, GNDVI, EVI)
-        - 3 observation mask indicators (1 = observed, 0 = missing)
-        - 3 orbital dynamics features (delta_t, orbital_phase, missed_5d_revisits)
-    Climate Embedding:
-        - Maps Köppen climate tokens [0, 8] to dense embedding vector
-    Outputs:
-        - 3 continuous reconstructed target indices (NDVI, GNDVI, EVI) per day
-    """
-
-    def __init__(
-        self,
-        input_dim: int = 27,
-        climate_dim: int = 8,
-        hidden_dim: int = 64,
-        num_layers: int = 2,
-        output_dim: int = 3,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.climate_embedding = nn.Embedding(NUM_CLIMATES, climate_dim)
-
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim + climate_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-
-        self.bigru = nn.GRU(
-            input_size=hidden_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-
-        self.head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        climate_id: Optional[torch.Tensor] = None,
-        padding_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: (Batch, Seq_len, input_dim)
-            climate_id: (Batch,) integer tensor in [0, NUM_CLIMATES-1]
-            padding_mask: (Batch, Seq_len) boolean tensor (True where real, False where padding)
-        Returns:
-            pred_targets: (Batch, Seq_len, 3) normalized daily targets
-        """
-        B, L, _ = x.shape
-
-        if climate_id is not None:
-            c_emb = self.climate_embedding(climate_id).unsqueeze(1).expand(B, L, -1)
-        else:
-            unknown_ids = torch.zeros(B, dtype=torch.long, device=x.device)
-            c_emb = self.climate_embedding(unknown_ids).unsqueeze(1).expand(B, L, -1)
-
-        x_combined = torch.cat([x, c_emb], dim=-1)
-        h = self.input_proj(x_combined)
-        gru_out, _ = self.bigru(h)
-        pred_targets = self.head(gru_out)
-
-        if padding_mask is not None:
-            pred_targets = pred_targets * padding_mask.unsqueeze(-1).float()
-
-        return pred_targets
+from src.models.history_imputer import BiGRUHistoryImputer
 
 
 # =====================================================================
@@ -256,14 +168,14 @@ def impute_sequence(
     model: Optional[BiGRUHistoryImputer] = None,
     scaler: Optional[ArcsinhScaler] = None,
     device: Optional[str] = None,
-    clip_min: float = -1.0,
-    clip_max: float = 1.0,
+    clip_min: Optional[float] = -1.0,
+    clip_max: Optional[float] = 1.0,
 ) -> np.ndarray:
     """
     Imputes missing target values (columns 18, 19, 20) in a history array (L, 21).
-    Preserves exact ground truth values on observed clear-sky dates.
+    Preserves exact ground truth values on observed clear-sky dates and leaves weather columns untouched.
     Returns:
-        Complete history array (L, 21) on original physical scale with zero NaNs.
+        History array (L, 21) on original physical scale with imputed targets.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -291,8 +203,10 @@ def impute_sequence(
         missing_mask = m_raw[:, col]
         out[missing_mask, col] = preds_orig[missing_mask, idx]
 
-    out[:, 18:21] = np.clip(out[:, 18:21], a_min=clip_min, a_max=clip_max)
-    return np.nan_to_num(out, nan=0.0)
+    if clip_min is not None or clip_max is not None:
+        out[:, 18:21] = np.clip(out[:, 18:21], a_min=clip_min, a_max=clip_max)
+    out[:, 18:21] = np.nan_to_num(out[:, 18:21], nan=0.0)
+    return out
 
 
 def impute_batch_sequences(
@@ -303,9 +217,12 @@ def impute_batch_sequences(
     scaler: ArcsinhScaler,
     device: Optional[str] = None,
     batch_size: int = 64,
+    clip_min: Optional[float] = -1.0,
+    clip_max: Optional[float] = 1.0,
 ) -> List[np.ndarray]:
     """
     Batched imputation for a list of history sequences (L_i, 21).
+    Only modifies missing target columns (18..20) and leaves weather columns (0..17) untouched.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
@@ -349,8 +266,10 @@ def impute_batch_sequences(
             for c_idx, col in enumerate([18, 19, 20]):
                 missing = m_i[:, col]
                 h_out[missing, col] = preds_i[missing, c_idx]
-            h_out[:, 18:21] = np.clip(h_out[:, 18:21], -1.0, 1.0)
-            results[start_idx + i] = np.nan_to_num(h_out, nan=0.0)
+            if clip_min is not None or clip_max is not None:
+                h_out[:, 18:21] = np.clip(h_out[:, 18:21], a_min=clip_min, a_max=clip_max)
+            h_out[:, 18:21] = np.nan_to_num(h_out[:, 18:21], nan=0.0)
+            results[start_idx + i] = h_out
 
     return results
 
@@ -492,99 +411,11 @@ def train_imputer(
     device: Optional[str] = None,
 ):
     """
-    End-to-end training loop for the Bi-GRU History Imputer.
+    Delegates to the canonical training pipeline in src.train_imputer.
     """
-    from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
+    from src.train_imputer import train_imputer as _train_imputer
 
-    cfg = load_config(config_path)
-    paths_cfg = cfg["paths"]
-    data_cfg = cfg["data"]
-    m_cfg = cfg["imputer_model"]
-    t_cfg = cfg["imputer_training"]
-
-    data_dir = paths_cfg["train_data_dir"]
-    scaler_path = paths_cfg["scaler_path"]
-    save_path = paths_cfg["checkpoints_dir"] / t_cfg["checkpoint_name"]
-
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    scaler = ArcsinhScaler(scaler_path)
-
-    all_files = sorted(list(data_dir.glob("*.npz")))
-    num_train = data_cfg["num_train_tiles"]
-    num_val = data_cfg["num_val_tiles"]
-
-    train_files = all_files[:num_train]
-    val_files = all_files[num_train : num_train + num_val]
-
-    train_ds = HistoryImputationDataset(
-        data_dir, scaler=scaler, file_list=train_files, mask_dropout=True,
-        climate_dropout_p=data_cfg["climate_dropout_p"], seed=data_cfg["seed"]
-    )
-    val_ds = HistoryImputationDataset(
-        data_dir, scaler=scaler, file_list=val_files, mask_dropout=False,
-        climate_dropout_p=0.0, seed=data_cfg["seed"]
-    )
-
-    train_loader = DataLoader(train_ds, batch_size=t_cfg["batch_size"], shuffle=True, collate_fn=collate_history_batch)
-    val_loader = DataLoader(val_ds, batch_size=t_cfg["batch_size"], shuffle=False, collate_fn=collate_history_batch)
-
-    model = BiGRUHistoryImputer(
-        input_dim=m_cfg["input_dim"],
-        climate_dim=m_cfg["climate_dim"],
-        hidden_dim=m_cfg["hidden_dim"],
-        num_layers=m_cfg["num_layers"],
-        output_dim=m_cfg["output_dim"],
-        dropout=m_cfg["dropout"],
-    ).to(device)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=t_cfg["learning_rate"], weight_decay=t_cfg["weight_decay"])
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=1)
-
-    best_val_loss = float("inf")
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-
-    print(f"[*] Training Bi-GRU Imputer on {len(train_ds)} train samples, {len(val_ds)} val samples.")
-    for epoch in range(1, t_cfg["epochs"] + 1):
-        model.train()
-        total_loss, total_recon = 0.0, 0.0
-        batches = 0
-        for b in train_loader:
-            x, c, t, lm, pm = b["input"].to(device), b["climate_id"].to(device), b["target"].to(device), b["loss_mask"].to(device), b["padding_mask"].to(device)
-            optimizer.zero_grad()
-            preds = model(x, climate_id=c, padding_mask=pm)
-            loss, recon = compute_masked_loss(preds, t, lm, pm, smoothness_weight=t_cfg["smoothness_weight"])
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            total_loss += loss.item()
-            total_recon += recon.item()
-            batches += 1
-
-        # Validation
-        model.eval()
-        v_loss, v_batches = 0.0, 0
-        with torch.no_grad():
-            for b in val_loader:
-                x, c, t, lm, pm = b["input"].to(device), b["climate_id"].to(device), b["target"].to(device), b["loss_mask"].to(device), b["padding_mask"].to(device)
-                preds = model(x, climate_id=c, padding_mask=pm)
-                loss, _ = compute_masked_loss(preds, t, lm, pm, smoothness_weight=t_cfg["smoothness_weight"])
-                v_loss += loss.item()
-                v_batches += 1
-
-        avg_v_loss = v_loss / max(1, v_batches)
-        scheduler.step(avg_v_loss)
-        print(f"Epoch {epoch:02d}/{t_cfg['epochs']} | Train Loss: {total_loss/batches:.4f} | Val Loss: {avg_v_loss:.4f}")
-
-        if avg_v_loss < best_val_loss:
-            best_val_loss = avg_v_loss
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "config": cfg,
-                "val_loss": best_val_loss,
-            }, save_path)
-            print(f"  -> Saved best checkpoint to: {save_path}")
+    return _train_imputer(config_path=config_path, device=device)
 
 
 # =====================================================================

@@ -4,6 +4,7 @@ Data loading, processing, and transformation modules.
 
 from src.data.transforms import ArcsinhScaler
 from src.data.climate import encode_climate, CLIMATE_TO_ID, ID_TO_CLIMATE, NUM_CLIMATES
+from src.data.splits import get_tile_dominant_climate, get_train_val_tile_split
 from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
 from src.data.vegetation_dataset import VegetationDataset, collate_vegetation_batch
 from src.data.bigru_imputer import (
@@ -38,6 +39,8 @@ __all__ = [
     "CLIMATE_TO_ID",
     "ID_TO_CLIMATE",
     "NUM_CLIMATES",
+    "get_tile_dominant_climate",
+    "get_train_val_tile_split",
     "HistoryImputationDataset",
     "collate_history_batch",
     "VegetationDataset",
