@@ -6,7 +6,7 @@ evaluate, and perform inference/imputation on satellite time-series data.
 Features:
 1. Neural Model Architecture (BiGRUHistoryImputer with Climate Embedding).
 2. Orbital Mechanics Calculations (5-day Sentinel-2 cadence, phase, revisit gaps).
-3. Feature Engineering & Preprocessing (Arcsinh transform, 27-dim vector).
+3. Feature Engineering & Preprocessing (Arcsinh transform, 35 input channels).
 4. Safe Model Loading & Checkpoint Management.
 5. Sequence & Batch Imputation (replaces NaNs with continuous physical predictions).
 6. File-level Imputation (processes full .npz datasets).
@@ -37,95 +37,17 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.transforms import ArcsinhScaler
-from src.data.climate import encode_climate, NUM_CLIMATES
+from src.data.climate import encode_climate
+from src.data.weather_preprocessor import preprocess_weather_covariates
+from src.models.history_imputer import (
+    HISTORY_IMPUTER_CHECKPOINT_NAME,
+    HISTORY_IMPUTER_INPUT_DIM,
+    BiGRUHistoryImputer,
+)
 from src.utils.config import load_config
 
 
-# =====================================================================
-# 1. NEURAL ARCHITECTURE
-# =====================================================================
-
-class BiGRUHistoryImputer(nn.Module):
-    """
-    Bidirectional GRU for imputing and densifying sparse satellite target time series.
-    Inputs (27 dims):
-        - 18 weather & Fourier calendar features
-        - 3 sparse normalized target values (NDVI, GNDVI, EVI)
-        - 3 observation mask indicators (1 = observed, 0 = missing)
-        - 3 orbital dynamics features (delta_t, orbital_phase, missed_5d_revisits)
-    Climate Embedding:
-        - Maps Köppen climate tokens [0, 8] to dense embedding vector
-    Outputs:
-        - 3 continuous reconstructed target indices (NDVI, GNDVI, EVI) per day
-    """
-
-    def __init__(
-        self,
-        input_dim: int = 27,
-        climate_dim: int = 8,
-        hidden_dim: int = 64,
-        num_layers: int = 2,
-        output_dim: int = 3,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.climate_embedding = nn.Embedding(NUM_CLIMATES, climate_dim)
-
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim + climate_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-
-        self.bigru = nn.GRU(
-            input_size=hidden_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-
-        self.head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        climate_id: Optional[torch.Tensor] = None,
-        padding_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: (Batch, Seq_len, input_dim)
-            climate_id: (Batch,) integer tensor in [0, NUM_CLIMATES-1]
-            padding_mask: (Batch, Seq_len) boolean tensor (True where real, False where padding)
-        Returns:
-            pred_targets: (Batch, Seq_len, 3) normalized daily targets
-        """
-        B, L, _ = x.shape
-
-        if climate_id is not None:
-            c_emb = self.climate_embedding(climate_id).unsqueeze(1).expand(B, L, -1)
-        else:
-            unknown_ids = torch.zeros(B, dtype=torch.long, device=x.device)
-            c_emb = self.climate_embedding(unknown_ids).unsqueeze(1).expand(B, L, -1)
-
-        x_combined = torch.cat([x, c_emb], dim=-1)
-        h = self.input_proj(x_combined)
-        gru_out, _ = self.bigru(h)
-        pred_targets = self.head(gru_out)
-
-        if padding_mask is not None:
-            pred_targets = pred_targets * padding_mask.unsqueeze(-1).float()
-
-        return pred_targets
+DEFAULT_CHECKPOINT_PATH = Path("checkpoints") / HISTORY_IMPUTER_CHECKPOINT_NAME
 
 
 # =====================================================================
@@ -174,14 +96,14 @@ def build_imputer_features(
     obs_mask_override: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
-    Builds the standardized 27-dimensional feature matrix for a history sequence:
-        [18 weather/calendar, 3 normalized targets, 3 mask flags, 3 orbital dynamics].
+    Build the 35 input channels for one history sequence, in training order.
     """
+    h_raw = np.asarray(h_raw, dtype=np.float32)
+    m_raw = np.asarray(m_raw, dtype=bool)
     L = h_raw.shape[0]
 
-    # 1. Weather + Calendar DOY features (0..17)
-    norm_weather = scaler.transform_features(h_raw)[:, :18]
-    norm_weather = np.nan_to_num(norm_weather, nan=0.0)
+    # 1. Weather, cloud and calendar features plus weather flags
+    norm_weather, weather_mask = preprocess_weather_covariates(h_raw, m_raw, scaler)
 
     # 2. Observed targets (18..20)
     targets_raw = h_raw[:, 18:21]
@@ -205,7 +127,9 @@ def build_imputer_features(
     orbital_feats = np.stack([delta_t, phase, missed], axis=-1)
 
     # Concatenate full vector
-    features = np.concatenate([norm_weather, input_targets, mask_feat, orbital_feats], axis=-1)
+    features = np.concatenate(
+        [norm_weather, input_targets, mask_feat, orbital_feats, weather_mask], axis=-1
+    )
     return np.nan_to_num(features, nan=0.0)
 
 
@@ -214,7 +138,7 @@ def build_imputer_features(
 # =====================================================================
 
 def load_imputer_checkpoint(
-    checkpoint_path: Union[str, Path] = "checkpoints/history_imputer_best.pt",
+    checkpoint_path: Union[str, Path] = DEFAULT_CHECKPOINT_PATH,
     device: Optional[str] = None,
 ) -> Tuple[BiGRUHistoryImputer, Dict]:
     """
@@ -226,25 +150,30 @@ def load_imputer_checkpoint(
         raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path.resolve()}")
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    m_cfg = ckpt.get("config", {}).get("imputer_model", {
-        "input_dim": 27,
-        "climate_dim": 8,
-        "hidden_dim": 64,
-        "num_layers": 2,
-        "output_dim": 3,
-        "dropout": 0.1,
-    })
+    m_cfg = ckpt.get("config", {}).get("imputer_model", {})
+    input_dim = m_cfg.get("input_dim", HISTORY_IMPUTER_INPUT_DIM)
+    climate_dim = m_cfg.get("climate_dim", 8)
+    state_dict = ckpt["model_state_dict"]
+    input_weight = state_dict.get("input_proj.0.weight")
+    if input_dim != HISTORY_IMPUTER_INPUT_DIM or (
+        input_weight is not None and input_weight.shape[1] != input_dim + climate_dim
+    ):
+        raise ValueError(
+            f"Checkpoint {ckpt_path} is incompatible with the "
+            f"{HISTORY_IMPUTER_INPUT_DIM}-channel history imputer. "
+            f"Use a checkpoint trained with weather masks ({HISTORY_IMPUTER_CHECKPOINT_NAME})."
+        )
 
     model = BiGRUHistoryImputer(
-        input_dim=m_cfg.get("input_dim", 27),
-        climate_dim=m_cfg.get("climate_dim", 8),
+        input_dim=input_dim,
+        climate_dim=climate_dim,
         hidden_dim=m_cfg.get("hidden_dim", 64),
         num_layers=m_cfg.get("num_layers", 2),
         output_dim=m_cfg.get("output_dim", 3),
         dropout=m_cfg.get("dropout", 0.1),
     ).to(device)
 
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(state_dict)
     model.eval()
     return model, ckpt
 
@@ -263,7 +192,7 @@ def impute_sequence(
     Imputes missing target values (columns 18, 19, 20) in a history array (L, 21).
     Preserves exact ground truth values on observed clear-sky dates.
     Returns:
-        Complete history array (L, 21) on original physical scale with zero NaNs.
+        History on the original scale with missing targets filled and covariates preserved.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -292,7 +221,7 @@ def impute_sequence(
         out[missing_mask, col] = preds_orig[missing_mask, idx]
 
     out[:, 18:21] = np.clip(out[:, 18:21], a_min=clip_min, a_max=clip_max)
-    return np.nan_to_num(out, nan=0.0)
+    return out
 
 
 def impute_batch_sequences(
@@ -324,7 +253,7 @@ def impute_batch_sequences(
         max_l = max(lengths)
         B = len(feats)
 
-        x_padded = torch.zeros(B, max_l, 27, dtype=torch.float32)
+        x_padded = torch.zeros(B, max_l, feats[0].shape[-1], dtype=torch.float32)
         pad_mask = torch.zeros(B, max_l, dtype=torch.bool)
         c_ids = torch.zeros(B, dtype=torch.long)
 
@@ -350,7 +279,7 @@ def impute_batch_sequences(
                 missing = m_i[:, col]
                 h_out[missing, col] = preds_i[missing, c_idx]
             h_out[:, 18:21] = np.clip(h_out[:, 18:21], -1.0, 1.0)
-            results[start_idx + i] = np.nan_to_num(h_out, nan=0.0)
+            results[start_idx + i] = h_out
 
     return results
 
@@ -595,7 +524,7 @@ def main():
     parser = argparse.ArgumentParser(description="Bi-GRU History Imputer CLI")
     parser.add_argument("--mode", type=str, choices=["test", "evaluate", "train"], default="test",
                         help="Execution mode: test (impute 1 sample), evaluate (leave-one-out metrics), or train")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/history_imputer_best.pt",
+    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT_PATH,
                         help="Path to trained imputer checkpoint")
     parser.add_argument("--scaler", type=str, default="DATA/train_multi_output_clear_sky/scaler.json",
                         help="Path to scaler.json")
