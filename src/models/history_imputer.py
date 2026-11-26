@@ -8,7 +8,8 @@ import torch
 import torch.nn as nn
 from typing import Dict, Tuple, Optional
 
-from src.data.climate import NUM_CLIMATES
+# NOTE: src.data.climate is imported lazily inside __init__ to avoid a circular
+# import (src.data -> bigru_imputer -> src.models.history_imputer -> src.data).
 
 
 class BiGRUHistoryImputer(nn.Module):
@@ -36,6 +37,8 @@ class BiGRUHistoryImputer(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
+        from src.data.climate import NUM_CLIMATES
+
         self.climate_embedding = nn.Embedding(NUM_CLIMATES, climate_dim)
 
         self.input_proj = nn.Sequential(
