@@ -20,6 +20,21 @@ data:
   climate_dropout_p: 0.35 # Probabilità di sostituire il clima noto con <UNKNOWN> durante il training
 
 # ---------------------------------------------------------------------
+# Strategia di Interpolazione del Dataset di Addestramento (Factory)
+# ---------------------------------------------------------------------
+interpolation:
+  # Strategie disponibili nel factory:
+  # 'linear', 'forward_fill' (locf), 'backward_fill', 'nearest',
+  # 'spline' (pchip/cubic), 'mean', 'median', 'constant', 'model' (bigru), 'none'
+  strategy: "linear"
+  target_columns: [18, 19, 20]     # Colonne target storiche da interpolare (NDVI, GNDVI, EVI)
+  interpolate_weather: true         # Interpola anche eventuali rari buchi nel meteo (0..17)
+  clip_min: -1.0                    # Limite inferiore per indici di vegetazione
+  clip_max: 1.0                     # Limite superiore per indici di vegetazione
+  spline_kind: "pchip"              # 'pchip' preserva la forma fisica senza overshooting
+  model_checkpoint: "checkpoints/history_imputer_best.pt"
+
+# ---------------------------------------------------------------------
 # Modello di Imputazione del Passato (Bi-GRU Imputer)
 # ---------------------------------------------------------------------
 imputer_model:

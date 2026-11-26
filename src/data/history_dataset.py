@@ -9,19 +9,21 @@ Implements:
 """
 
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Union, Sequence
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 from src.data.transforms import ArcsinhScaler
 from src.data.climate import encode_climate, NUM_CLIMATES
+from src.data.interpolation import InterpolationFactory, BaseInterpolator, ModelInterpolator
 
 
 class HistoryImputationDataset(Dataset):
     """
     Dataset for learning to impute and reconstruct the missing target days in the past (history).
     Incorporates Sentinel-2 orbital physics (5-day cadence) and climate tokenization.
+    Optionally supports plug-and-play interpolation strategies via InterpolationFactory.
     """
 
     def __init__(
@@ -33,13 +35,21 @@ class HistoryImputationDataset(Dataset):
         file_list: Optional[List[Path]] = None,
         mask_dropout: bool = True,
         climate_dropout_p: float = 0.35,
+        interpolation_strategy: Optional[Union[str, BaseInterpolator]] = None,
+        interpolation_columns: Optional[Sequence[int]] = (18, 19, 20),
         seed: int = 42,
     ):
         super().__init__()
         self.scaler = scaler
         self.mask_dropout = mask_dropout
         self.climate_dropout_p = climate_dropout_p
+        self.interpolation_columns = interpolation_columns
         self.rng = np.random.RandomState(seed)
+
+        if interpolation_strategy is not None and str(interpolation_strategy).lower() != "none":
+            self.interpolator = InterpolationFactory.create(interpolation_strategy)
+        else:
+            self.interpolator = None
 
         data_dir = Path(data_dir)
         if file_list is not None:
@@ -139,10 +149,18 @@ class HistoryImputationDataset(Dataset):
         else:
             eval_supervision_mask = obs_mask.copy()
 
-        # 3. Handle NaNs in input target
-        input_targets = norm_targets.copy()
-        input_targets[~input_obs_mask] = 0.0
-        input_targets = np.nan_to_num(input_targets, nan=0.0)
+        # 3. Handle NaNs in input target / Apply Interpolation Strategy
+        if self.interpolator is not None:
+            if isinstance(self.interpolator, ModelInterpolator):
+                h_interp = self.interpolator.interpolate_history_sample(h_raw, m_raw, raw_climate)
+            else:
+                h_interp = self.interpolator.interpolate(h_raw, mask=m_raw, columns=self.interpolation_columns)
+            input_targets = self.scaler.transform_targets(h_interp[:, 18:21])
+            input_targets = np.nan_to_num(input_targets, nan=0.0)
+        else:
+            input_targets = norm_targets.copy()
+            input_targets[~input_obs_mask] = 0.0
+            input_targets = np.nan_to_num(input_targets, nan=0.0)
 
         # Mask feature M_t (1.0 if observed in input, 0.0 otherwise)
         mask_feature = np.zeros((L, 3), dtype=np.float32)
