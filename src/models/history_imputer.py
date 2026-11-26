@@ -6,20 +6,22 @@ with native support for '<UNKNOWN>' climate tokens (crucial for OOD-S generaliza
 
 import torch
 import torch.nn as nn
-from typing import Dict, Tuple, Optional
+from typing import Optional
 
-from src.data.climate import NUM_CLIMATES
+HISTORY_IMPUTER_INPUT_DIM = 35
+HISTORY_IMPUTER_CHECKPOINT_NAME = "history_imputer_weather_mask_best.pt"
 
 
 class BiGRUHistoryImputer(nn.Module):
     """
     Bidirectional GRU for imputing and densifying sparse satellite target time series.
     Input dims:
-        - 18 weather & Fourier calendar features
+        - 18 weather, cloud and calendar features
         - 3 sparse normalized target values
         - 3 observation mask indicators (1 = observed, 0 = missing)
         - 3 orbital dynamics features (delta_t, orbital_phase (t % 5)/5, missed_5d_revisits)
-        Total input_dim = 27
+        - 8 weather observation flags (1 = observed, 0 = missing)
+        Total input_dim = 35
     Climate Embedding:
         - 9 classes (0 = <UNKNOWN>, 1..8 = Köppen classes) -> mapped to 8-dim embedding
     Output dims:
@@ -28,7 +30,7 @@ class BiGRUHistoryImputer(nn.Module):
 
     def __init__(
         self,
-        input_dim: int = 27,
+        input_dim: int = HISTORY_IMPUTER_INPUT_DIM,
         climate_dim: int = 8,
         hidden_dim: int = 64,
         num_layers: int = 2,
@@ -36,6 +38,10 @@ class BiGRUHistoryImputer(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
+        # src.data exports this model, so import the vocabulary at construction time.
+        from src.data.climate import NUM_CLIMATES
+
+        self.input_dim = input_dim
         self.climate_embedding = nn.Embedding(NUM_CLIMATES, climate_dim)
 
         self.input_proj = nn.Sequential(
@@ -75,7 +81,9 @@ class BiGRUHistoryImputer(nn.Module):
         Returns:
             pred_targets: (Batch, Seq_len, 3) daily reconstructed normalized targets
         """
-        B, L, _ = x.shape
+        B, L, input_dim = x.shape
+        if input_dim != self.input_dim:
+            raise ValueError(f"Expected {self.input_dim} history channels, received {input_dim}")
 
         if climate_id is not None:
             # (B, climate_dim) -> expand to (B, L, climate_dim)

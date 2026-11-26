@@ -29,6 +29,7 @@ from src.data.interpolation import (
 )
 from src.data.transforms import ArcsinhScaler
 from src.data.vegetation_dataset import VegetationDataset, collate_vegetation_batch
+from src.models.history_imputer import HISTORY_IMPUTER_CHECKPOINT_NAME
 
 
 def test_factory_registration():
@@ -165,7 +166,6 @@ def test_dataset_integration():
             max_files=1,
             interpolation_strategy=strat,
             interpolation_columns=[18, 19, 20],
-            interpolate_weather=True,
         )
 
         sample = ds[0]
@@ -179,6 +179,8 @@ def test_dataset_integration():
         assert not torch.isnan(tgt).any(), f"NaN found in target using strategy {strat}!"
         assert hist.shape[-1] == 21, f"Expected 21 features in history, got {hist.shape[-1]}"
         assert tgt.shape == (3, 3), f"Expected (3, 3) target, got {tgt.shape}"
+        assert sample["history_weather_mask"].shape == (hist.shape[0], 8)
+        assert sample["future_weather_mask"].shape == (fut.shape[0], 8)
 
         print(f"[+] VegetationDataset with strategy='{strat}' PASSED (sample seq len: {hist.shape[0]}).")
 
@@ -192,7 +194,7 @@ def test_dataset_integration():
 
 
 def test_model_interpolator():
-    ckpt_path = PROJECT_ROOT / "checkpoints" / "history_imputer_best.pt"
+    ckpt_path = PROJECT_ROOT / "checkpoints" / HISTORY_IMPUTER_CHECKPOINT_NAME
     scaler_path = PROJECT_ROOT / "DATA" / "train_multi_output_clear_sky" / "scaler.json"
 
     if not ckpt_path.exists():
@@ -217,7 +219,8 @@ def test_model_interpolator():
 
     imputed = model_int.interpolate_history_sample(h0, m0, climate0)
     assert imputed.shape == h0.shape
-    assert not np.any(np.isnan(imputed))
+    assert not np.any(np.isnan(imputed[:, 18:21]))
+    np.testing.assert_array_equal(imputed[:, :18], h0[:, :18])
     # Original valid observations must be preserved or within valid bounds
     obs_mask = ~m0[:, 18]
     np.testing.assert_allclose(imputed[obs_mask, 18], h0[obs_mask, 18], rtol=1e-5)

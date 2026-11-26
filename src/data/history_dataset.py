@@ -16,7 +16,13 @@ from torch.utils.data import Dataset
 
 from src.data.transforms import ArcsinhScaler
 from src.data.climate import encode_climate, NUM_CLIMATES
-from src.data.interpolation import InterpolationFactory, BaseInterpolator, ModelInterpolator
+from src.data.interpolation import (
+    VEGETATION_COLUMNS,
+    BaseInterpolator,
+    InterpolationFactory,
+    ModelInterpolator,
+)
+from src.data.weather_preprocessor import preprocess_weather_covariates
 
 
 class HistoryImputationDataset(Dataset):
@@ -36,14 +42,18 @@ class HistoryImputationDataset(Dataset):
         mask_dropout: bool = True,
         climate_dropout_p: float = 0.35,
         interpolation_strategy: Optional[Union[str, BaseInterpolator]] = None,
-        interpolation_columns: Optional[Sequence[int]] = (18, 19, 20),
+        interpolation_columns: Optional[Sequence[int]] = VEGETATION_COLUMNS,
         seed: int = 42,
     ):
         super().__init__()
         self.scaler = scaler
         self.mask_dropout = mask_dropout
         self.climate_dropout_p = climate_dropout_p
-        self.interpolation_columns = interpolation_columns
+        self.interpolation_columns = (
+            VEGETATION_COLUMNS if interpolation_columns is None else tuple(interpolation_columns)
+        )
+        if not set(self.interpolation_columns).issubset(VEGETATION_COLUMNS):
+            raise ValueError("Only history vegetation columns (18, 19, 20) can be interpolated")
         self.rng = np.random.RandomState(seed)
 
         if interpolation_strategy is not None and str(interpolation_strategy).lower() != "none":
@@ -121,14 +131,15 @@ class HistoryImputationDataset(Dataset):
         fpath, s_idx = self.samples[idx]
         cached = self.file_cache[fpath]
         h_raw = cached["history"][s_idx].astype(np.float32)  # shape (L, 21)
-        m_raw = cached["history_mask"][s_idx]               # shape (L, 21), True where missing
+        m_raw = cached["history_mask"][s_idx].astype(bool, copy=False)  # True where missing
         raw_climate = str(cached["climate"][s_idx])
 
         L = h_raw.shape[0]
 
-        # 1. Feature normalization with ArcsinhScaler
-        norm_weather_calendar = self.scaler.transform_features(h_raw)[:, :18]
-        norm_weather_calendar = np.nan_to_num(norm_weather_calendar, nan=0.0)
+        # 1. Covariate normalization and individual weather observation flags
+        norm_weather_calendar, weather_mask = preprocess_weather_covariates(
+            h_raw, m_raw, self.scaler
+        )
 
         # Targets 18..20 (NDVI, GNDVI, EVI)
         targets_raw = h_raw[:, 18:21]
@@ -170,9 +181,11 @@ class HistoryImputationDataset(Dataset):
         delta_t, orbital_phase, missed_revisits = self._compute_orbital_dynamics(input_obs_mask)
         orbital_feats = np.stack([delta_t, orbital_phase, missed_revisits], axis=-1)  # (L, 3)
 
-        # Concatenate full input vector:
-        # [weather_calendar (18), input_targets (3), mask_feature (3), orbital_feats (3)] -> total 27 dims
-        model_input = np.concatenate([norm_weather_calendar, input_targets, mask_feature, orbital_feats], axis=-1)
+        # Keep the original channel order and append eight weather flags.
+        model_input = np.concatenate(
+            [norm_weather_calendar, input_targets, mask_feature, orbital_feats, weather_mask],
+            axis=-1,
+        )
         model_input = np.nan_to_num(model_input, nan=0.0)
 
         # 5. Climate tokenization & Climate Dropout

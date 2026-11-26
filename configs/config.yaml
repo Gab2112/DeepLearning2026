@@ -28,17 +28,17 @@ interpolation:
   # 'spline' (pchip/cubic), 'mean', 'median', 'constant', 'model' (bigru), 'none'
   strategy: "linear"
   target_columns: [18, 19, 20]     # Colonne target storiche da interpolare (NDVI, GNDVI, EVI)
-  interpolate_weather: true         # Interpola anche eventuali rari buchi nel meteo (0..17)
+  interpolate_weather: false        # Meteo gestito con zero filling normalizzato e maschere
   clip_min: -1.0                    # Limite inferiore per indici di vegetazione
   clip_max: 1.0                     # Limite superiore per indici di vegetazione
   spline_kind: "pchip"              # 'pchip' preserva la forma fisica senza overshooting
-  model_checkpoint: "checkpoints/history_imputer_best.pt"
+  model_checkpoint: "checkpoints/history_imputer_weather_mask_best.pt"
 
 # ---------------------------------------------------------------------
 # Modello di Imputazione del Passato (Bi-GRU Imputer)
 # ---------------------------------------------------------------------
 imputer_model:
-  input_dim: 27           # 18 meteo/DOY + 3 target sparsi + 3 maschere + 3 orbita/tempo
+  input_dim: 35           # 18 covariate + 3 target + 3 mask target + 3 orbita/tempo + 8 mask meteo
   climate_dim: 8          # Dimensione dell'embedding per le classi climatiche di Köppen
   hidden_dim: 64
   num_layers: 2
@@ -51,7 +51,7 @@ imputer_training:
   learning_rate: 0.001
   weight_decay: 0.0001
   smoothness_weight: 0.05 # Peso della regolarizzazione temporale per evitare salti discontinui
-  checkpoint_name: "history_imputer_best.pt"
+  checkpoint_name: "history_imputer_weather_mask_best.pt"
 
 # ---------------------------------------------------------------------
 # Modello di Forecasting Futuro (Predizione multi-step e probabilistica)

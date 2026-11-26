@@ -11,6 +11,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from src.models.history_imputer import HISTORY_IMPUTER_CHECKPOINT_NAME
+
+VEGETATION_COLUMNS = (18, 19, 20)
+
 
 class BaseInterpolator(ABC):
     """
@@ -370,7 +374,7 @@ class ModelInterpolator(BaseInterpolator):
 
     def __init__(
         self,
-        checkpoint_path: Union[str, Path] = "checkpoints/history_imputer_best.pt",
+        checkpoint_path: Union[str, Path] = Path("checkpoints") / HISTORY_IMPUTER_CHECKPOINT_NAME,
         scaler_path: Union[str, Path] = "DATA/train_multi_output_clear_sky/scaler.json",
         device: Optional[str] = None,
         clip_min: Optional[float] = -1.0,
@@ -387,38 +391,14 @@ class ModelInterpolator(BaseInterpolator):
         self._load_resources()
 
     def _load_resources(self):
-        import sys
-        import pathlib
-        if "pathlib._local" not in sys.modules:
-            sys.modules["pathlib._local"] = pathlib
-
+        from src.data.bigru_imputer import load_imputer_checkpoint
         from src.data.transforms import ArcsinhScaler
-        from src.models.history_imputer import BiGRUHistoryImputer
 
         if self.scaler_path.exists():
             self.scaler = ArcsinhScaler(self.scaler_path)
 
         if self.checkpoint_path.exists():
-            ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
-            m_cfg = ckpt.get("config", {}).get("imputer_model", {
-                "input_dim": 27,
-                "climate_dim": 8,
-                "hidden_dim": 64,
-                "num_layers": 2,
-                "output_dim": 3,
-                "dropout": 0.1,
-            })
-            self.model = BiGRUHistoryImputer(
-                input_dim=m_cfg.get("input_dim", 27),
-                climate_dim=m_cfg.get("climate_dim", 8),
-                hidden_dim=m_cfg.get("hidden_dim", 64),
-                num_layers=m_cfg.get("num_layers", 2),
-                output_dim=m_cfg.get("output_dim", 3),
-                dropout=m_cfg.get("dropout", 0.1),
-            ).to(self.device)
-
-            self.model.load_state_dict(ckpt["model_state_dict"])
-            self.model.eval()
+            self.model, _ = load_imputer_checkpoint(self.checkpoint_path, device=self.device)
 
     def _interpolate_1d(self, series: np.ndarray, mask: np.ndarray) -> np.ndarray:
         # Fallback to linear if 1D called without full features context
@@ -440,45 +420,12 @@ class ModelInterpolator(BaseInterpolator):
         if self.model is None or self.scaler is None:
             # Fallback to linear if model or scaler checkpoint is unavailable
             linear = LinearInterpolator(clip_min=self.clip_min, clip_max=self.clip_max)
-            return linear.interpolate(h_raw, mask=m_raw, columns=[18, 19, 20])
+            return linear.interpolate(h_raw, mask=m_raw, columns=VEGETATION_COLUMNS)
 
-        L = h_raw.shape[0]
-        norm_weather = self.scaler.transform_features(h_raw)[:, :18]
-        norm_weather = np.nan_to_num(norm_weather, nan=0.0)
-
-        targets_raw = h_raw[:, 18:21]
-        norm_targets = self.scaler.transform_targets(targets_raw)
-
-        obs_mask = ~m_raw[:, 18]
-        input_targets = norm_targets.copy()
-        input_targets[~obs_mask] = 0.0
-        input_targets = np.nan_to_num(input_targets, nan=0.0)
-
-        mask_feature = np.zeros((L, 3), dtype=np.float32)
-        mask_feature[obs_mask] = 1.0
-
-        # Orbital dynamics
-        delta_t = np.zeros(L, dtype=np.float32)
-        orbital_phase = np.zeros(L, dtype=np.float32)
-        missed_revisits = np.zeros(L, dtype=np.float32)
-        last_obs = 0.0
-        has_seen = False
-        for t in range(L):
-            orbital_phase[t] = (t % 5) / 5.0
-            if obs_mask[t]:
-                last_obs = float(t)
-                has_seen = True
-            else:
-                if has_seen:
-                    elapsed = float(t) - last_obs
-                    delta_t[t] = elapsed
-                    missed_revisits[t] = float(np.floor(elapsed / 5.0))
-
-        orbital_feats = np.stack([delta_t, orbital_phase, missed_revisits], axis=-1)
-        model_input = np.concatenate([norm_weather, input_targets, mask_feature, orbital_feats], axis=-1)
-        model_input = np.nan_to_num(model_input, nan=0.0)
-
+        from src.data.bigru_imputer import build_imputer_features
         from src.data.climate import encode_climate
+
+        model_input = build_imputer_features(h_raw, m_raw, self.scaler)
         climate_id = encode_climate(climate_str)
 
         x_t = torch.from_numpy(model_input).float().unsqueeze(0).to(self.device)
@@ -487,11 +434,11 @@ class ModelInterpolator(BaseInterpolator):
         with torch.no_grad():
             preds_norm = self.model(x_t, climate_id=c_t).squeeze(0).cpu().numpy()
 
-        preds_orig = self.scaler.inverse_transform_targets(preds_norm)
+        preds_orig = self._apply_clip(self.scaler.inverse_transform_targets(preds_norm))
 
         out = h_raw.copy()
-        for idx, col in enumerate([18, 19, 20]):
+        for idx, col in enumerate(VEGETATION_COLUMNS):
             col_missing = m_raw[:, col]
             out[col_missing, col] = preds_orig[col_missing, idx]
 
-        return self._apply_clip(out)
+        return out

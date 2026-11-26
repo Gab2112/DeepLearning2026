@@ -27,7 +27,7 @@ import numpy as np
 from src.utils.config import load_config
 from src.data.transforms import ArcsinhScaler
 from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
-from src.models.history_imputer import BiGRUHistoryImputer
+from src.models.history_imputer import BiGRUHistoryImputer, HISTORY_IMPUTER_INPUT_DIM
 
 
 def compute_masked_loss(
@@ -70,6 +70,12 @@ def train_imputer(
     data_cfg = cfg["data"]
     m_cfg = cfg["imputer_model"]
     t_cfg = cfg["imputer_training"]
+
+    if m_cfg["input_dim"] != HISTORY_IMPUTER_INPUT_DIM:
+        raise ValueError(
+            f"History weather masking requires {HISTORY_IMPUTER_INPUT_DIM} input channels "
+            f"but the config specifies {m_cfg['input_dim']}"
+        )
 
     data_dir = paths_cfg["train_data_dir"]
     scaler_path = paths_cfg["scaler_path"]

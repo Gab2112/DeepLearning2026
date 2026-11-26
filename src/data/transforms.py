@@ -9,6 +9,13 @@ import numpy as np
 import torch
 
 
+def standardization_arcsinh(
+    x: np.ndarray, mean: np.ndarray, std: np.ndarray
+) -> np.ndarray:
+    """Normalize values using precomputed feature or target statistics."""
+    return np.arcsinh((x - mean) / std)
+
+
 class ArcsinhScaler:
     """
     Standardization followed by arcsinh transformation:
@@ -38,8 +45,7 @@ class ArcsinhScaler:
         x shape: (..., 21) or (..., F)
         Preserves NaNs.
         """
-        z = (x - self.mean) / self.std
-        return np.arcsinh(z)
+        return standardization_arcsinh(x, self.mean, self.std)
 
     def inverse_transform_features(self, y: np.ndarray) -> np.ndarray:
         return np.sinh(y) * self.std + self.mean
@@ -48,8 +54,7 @@ class ArcsinhScaler:
         """
         targets shape: (..., 3)
         """
-        z = (targets - self.target_mean) / self.target_std
-        return np.arcsinh(z)
+        return standardization_arcsinh(targets, self.target_mean, self.target_std)
 
     def inverse_transform_targets(self, y: np.ndarray) -> np.ndarray:
         return np.sinh(y) * self.target_std + self.target_mean
