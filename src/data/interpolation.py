@@ -5,11 +5,21 @@ Spline/PCHIP, Mean, Median, Constant/Zero, and Model-based (Bi-GRU).
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Sequence, Type, Union
+from typing import Any, Dict, List, Optional, Sequence, Type, Union
 from pathlib import Path
+import warnings
 
 import numpy as np
 import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _resolve_project_path(path: Union[str, Path]) -> Path:
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    return PROJECT_ROOT / p
 
 
 class BaseInterpolator(ABC):
@@ -380,11 +390,13 @@ class ModelInterpolator(BaseInterpolator):
         clip_min: Optional[float] = -1.0,
         clip_max: Optional[float] = 1.0,
         fill_value: float = 0.0,
+        strict_checkpoint: bool = False,
     ):
         super().__init__(clip_min=clip_min, clip_max=clip_max, fill_value=fill_value)
-        self.checkpoint_path = Path(checkpoint_path)
-        self.scaler_path = Path(scaler_path)
+        self.checkpoint_path = _resolve_project_path(checkpoint_path)
+        self.scaler_path = _resolve_project_path(scaler_path)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.strict_checkpoint = strict_checkpoint
 
         self.model = None
         self.scaler = None
@@ -423,6 +435,14 @@ class ModelInterpolator(BaseInterpolator):
 
             self.model.load_state_dict(ckpt["model_state_dict"])
             self.model.eval()
+        elif self.strict_checkpoint:
+            raise FileNotFoundError(f"Bi-GRU checkpoint not found at {self.checkpoint_path}")
+        else:
+            warnings.warn(
+                f"[ModelInterpolator] Checkpoint not found at {self.checkpoint_path}; "
+                "falling back to LinearInterpolator.",
+                RuntimeWarning,
+            )
 
     def _interpolate_1d(self, series: np.ndarray, mask: np.ndarray) -> np.ndarray:
         # Fallback to linear if 1D called without full features context
@@ -500,3 +520,168 @@ class ModelInterpolator(BaseInterpolator):
             clip_min=self.clip_min,
             clip_max=self.clip_max,
         )
+
+
+@InterpolationFactory.register("mae", aliases=["mae_imputer", "masked_autoencoder"])
+class MAEInterpolator(BaseInterpolator):
+    """
+    Learned neural network imputer using the pre-trained MAEHistoryImputer.
+    Supports both single-sample and batched history imputation without modifying weather columns.
+    """
+
+    supports_batch_history_imputation: bool = True
+
+    def __init__(
+        self,
+        checkpoint_path: Union[str, Path] = "checkpoints/mae_imputer_best.pt",
+        scaler_path: Union[str, Path] = "DATA/train_multi_output_clear_sky/scaler.json",
+        device: Optional[str] = None,
+        clip_min: Optional[float] = -1.0,
+        clip_max: Optional[float] = 1.0,
+        fill_value: float = 0.0,
+        strict_checkpoint: bool = False,
+    ):
+        super().__init__(clip_min=clip_min, clip_max=clip_max, fill_value=fill_value)
+        self.checkpoint_path = _resolve_project_path(checkpoint_path)
+        self.scaler_path = _resolve_project_path(scaler_path)
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.strict_checkpoint = strict_checkpoint
+
+        self.model = None
+        self.scaler = None
+        self._load_resources()
+
+    def _load_resources(self):
+        from src.data.transforms import ArcsinhScaler
+        from src.data.mae_imputer import load_mae_imputer_checkpoint
+
+        if self.scaler_path.exists():
+            self.scaler = ArcsinhScaler(self.scaler_path)
+
+        if self.checkpoint_path.exists():
+            self.model, _ = load_mae_imputer_checkpoint(
+                checkpoint_path=self.checkpoint_path,
+                device=self.device,
+            )
+        elif self.strict_checkpoint:
+            raise FileNotFoundError(f"MAE checkpoint not found at {self.checkpoint_path}")
+        else:
+            warnings.warn(
+                f"[MAEInterpolator] Checkpoint not found at {self.checkpoint_path}; "
+                "falling back to LinearInterpolator.",
+                RuntimeWarning,
+            )
+
+    def _interpolate_1d(self, series: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        valid_idx = np.where(~mask)[0]
+        missing_idx = np.where(mask)[0]
+        series[missing_idx] = np.interp(missing_idx, valid_idx, series[valid_idx])
+        return series
+
+    def interpolate_history_sample(
+        self,
+        h_raw: np.ndarray,
+        m_raw: np.ndarray,
+        climate_str: Optional[str] = None,
+    ) -> np.ndarray:
+        if self.model is None or self.scaler is None:
+            linear = LinearInterpolator(clip_min=self.clip_min, clip_max=self.clip_max)
+            return linear.interpolate(h_raw, mask=m_raw, columns=[18, 19, 20])
+
+        from src.data.mae_imputer import impute_sequence_mae
+
+        return impute_sequence_mae(
+            h_raw=h_raw,
+            m_raw=m_raw,
+            climate_str=climate_str,
+            model=self.model,
+            scaler=self.scaler,
+            device=self.device,
+            clip_min=self.clip_min,
+            clip_max=self.clip_max,
+        )
+
+    def interpolate_history_batch(
+        self,
+        histories: List[np.ndarray],
+        masks: List[np.ndarray],
+        climates: List[str],
+        batch_size: int = 128,
+    ) -> List[np.ndarray]:
+        if self.model is None or self.scaler is None:
+            linear = LinearInterpolator(clip_min=self.clip_min, clip_max=self.clip_max)
+            return [
+                linear.interpolate(h, mask=m, columns=[18, 19, 20])
+                for h, m in zip(histories, masks)
+            ]
+
+        from src.data.mae_imputer import impute_batch_sequences_mae
+
+        return impute_batch_sequences_mae(
+            histories=histories,
+            masks=masks,
+            climates=climates,
+            model=self.model,
+            scaler=self.scaler,
+            device=self.device,
+            batch_size=batch_size,
+            clip_min=self.clip_min,
+            clip_max=self.clip_max,
+        )
+
+
+def build_interpolator_from_config(
+    cfg: Dict[str, Any],
+    strict_checkpoint: bool = False,
+) -> BaseInterpolator:
+    """
+    Instantiates the configured interpolation strategy from configs/config.yaml,
+    automatically wiring checkpoint paths, scaler_path, spline_kind, and clip bounds.
+    """
+    interp_cfg = cfg.get("interpolation", {})
+    paths_cfg = cfg.get("paths", {})
+
+    strategy = str(interp_cfg.get("strategy", "linear")).strip().lower().replace("-", "_")
+    clip_min = interp_cfg.get("clip_min", -1.0)
+    clip_max = interp_cfg.get("clip_max", 1.0)
+    scaler_path = paths_cfg.get("scaler_path", "DATA/train_multi_output_clear_sky/scaler.json")
+
+    if strategy in ("mae", "mae_imputer", "masked_autoencoder"):
+        ckpt = interp_cfg.get("mae_checkpoint", "checkpoints/mae_imputer_best.pt")
+        return InterpolationFactory.create(
+            strategy,
+            checkpoint_path=ckpt,
+            scaler_path=scaler_path,
+            clip_min=clip_min,
+            clip_max=clip_max,
+            strict_checkpoint=strict_checkpoint,
+        )
+
+    if strategy in ("model", "bigru", "learned_imputer", "history_imputer"):
+        ckpt = interp_cfg.get("model_checkpoint", "checkpoints/history_imputer_best.pt")
+        return InterpolationFactory.create(
+            strategy,
+            checkpoint_path=ckpt,
+            scaler_path=scaler_path,
+            clip_min=clip_min,
+            clip_max=clip_max,
+            strict_checkpoint=strict_checkpoint,
+        )
+
+    if strategy in ("spline", "pchip", "cubic", "akima"):
+        kind = interp_cfg.get("spline_kind", "pchip") if strategy == "spline" else strategy
+        return InterpolationFactory.create(
+            "spline",
+            kind=kind,
+            clip_min=clip_min,
+            clip_max=clip_max,
+        )
+
+    if strategy in ("none", "identity", "pass_through"):
+        return InterpolationFactory.create("none")
+
+    return InterpolationFactory.create(
+        strategy,
+        clip_min=clip_min,
+        clip_max=clip_max,
+    )

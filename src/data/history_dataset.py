@@ -16,7 +16,7 @@ from torch.utils.data import Dataset
 
 from src.data.transforms import ArcsinhScaler
 from src.data.climate import encode_climate, NUM_CLIMATES
-from src.data.interpolation import InterpolationFactory, BaseInterpolator, ModelInterpolator
+from src.data.interpolation import InterpolationFactory, BaseInterpolator
 
 
 class HistoryImputationDataset(Dataset):
@@ -166,7 +166,7 @@ class HistoryImputationDataset(Dataset):
             h_for_interp = h_raw.copy()
             h_for_interp[~input_obs_mask, 18:21] = np.nan
 
-            if isinstance(self.interpolator, ModelInterpolator):
+            if hasattr(self.interpolator, "interpolate_history_sample"):
                 h_interp = self.interpolator.interpolate_history_sample(
                     h_for_interp, effective_mask, effective_climate_str
                 )

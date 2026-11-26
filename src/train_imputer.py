@@ -110,9 +110,9 @@ def train_imputer(
         data_dir,
         scaler=scaler,
         file_list=val_files,
-        mask_dropout=False,
+        mask_dropout=True,
         climate_dropout_p=0.0,
-        seed=seed,
+        seed=seed + 1,
     )
     print(f"[*] Campioni Train: {len(train_ds):,} | Campioni Val: {len(val_ds):,}")
 
@@ -170,12 +170,15 @@ def train_imputer(
         avg_train_loss = total_train_loss / max(1, batches)
         avg_train_recon = total_train_recon / max(1, batches)
 
-        # Validazione
+        # Validazione onesta su punti clear-sky mascherati
         model.eval()
         total_val_loss = 0.0
         val_batches = 0
-        val_mae_orig = []
+        abs_err_sum = np.zeros(3, dtype=np.float64)
+        count_masked = 0
+        target_names = ("NDVI", "GNDVI", "EVI")
 
+        val_ds.rng = np.random.RandomState(seed + 1)
         with torch.no_grad():
             for batch in val_loader:
                 x = batch["input"].to(device)
@@ -196,10 +199,15 @@ def train_imputer(
                     t_masked = target[loss_mask]
                     p_orig = scaler.torch_inverse_transform_targets(p_masked)
                     t_orig = scaler.torch_inverse_transform_targets(t_masked)
-                    val_mae_orig.append(torch.mean(torch.abs(p_orig - t_orig)).item())
+                    abs_err_sum += torch.abs(p_orig - t_orig).sum(dim=0).cpu().numpy()
+                    count_masked += int(loss_mask.sum().item())
 
         avg_val_loss = total_val_loss / max(1, val_batches)
-        avg_val_mae = np.mean(val_mae_orig) if val_mae_orig else 0.0
+        per_idx_mae = {
+            name: float(abs_err_sum[i] / max(1, count_masked))
+            for i, name in enumerate(target_names)
+        }
+        avg_val_mae = float(np.mean(list(per_idx_mae.values())))
         elapsed = time.time() - t0
 
         scheduler.step(avg_val_loss)
@@ -214,16 +222,23 @@ def train_imputer(
                 "config": cfg,
                 "val_loss": best_val_loss,
                 "val_mae_orig": avg_val_mae,
+                "val_mae_per_index": per_idx_mae,
             }, save_path)
 
         flag = " [BEST SAVED]" if is_best else ""
+        idx_str = " ".join(f"{n}={per_idx_mae[n]:.4f}" for n in target_names)
         print(f"Epoch {epoch:02d}/{epochs:02d} [{elapsed:4.1f}s] | "
               f"Train Loss: {avg_train_loss:.4f} (Recon: {avg_train_recon:.4f}) | "
-              f"Val Loss: {avg_val_loss:.4f} | Val MAE (Scala Reale): {avg_val_mae:.4f}{flag}")
+              f"Val Loss: {avg_val_loss:.4f} | Val MAE: {avg_val_mae:.4f} [{idx_str}]{flag}")
 
     print("-" * 65)
     print(f"[*] Training completato! Miglior checkpoint salvato in:\n    {save_path}")
 
+    if save_path.exists():
+        best_ckpt = torch.load(save_path, map_location=device, weights_only=False)
+        model.load_state_dict(best_ckpt["model_state_dict"])
+
+    val_ds.rng = np.random.RandomState(seed + 1)
     # Dimostrazione pratica su un campione di validazione
     demonstrate_imputation(model, val_ds, scaler, device)
 

@@ -18,9 +18,17 @@ from src.data.bigru_imputer import (
     compute_imputation_metrics,
     evaluate_imputer_on_sample,
 )
+from src.data.mae_imputer import (
+    MAEHistoryImputer,
+    load_mae_imputer_checkpoint,
+    impute_sequence_mae,
+    impute_batch_sequences_mae,
+    evaluate_mae_imputer_on_sample,
+)
 from src.data.interpolation import (
     BaseInterpolator,
     InterpolationFactory,
+    build_interpolator_from_config,
     LinearInterpolator,
     ForwardFillInterpolator,
     BackwardFillInterpolator,
@@ -31,6 +39,7 @@ from src.data.interpolation import (
     ConstantInterpolator,
     NoneInterpolator,
     ModelInterpolator,
+    MAEInterpolator,
 )
 
 __all__ = [
@@ -54,8 +63,14 @@ __all__ = [
     "impute_npz_file",
     "compute_imputation_metrics",
     "evaluate_imputer_on_sample",
+    "MAEHistoryImputer",
+    "load_mae_imputer_checkpoint",
+    "impute_sequence_mae",
+    "impute_batch_sequences_mae",
+    "evaluate_mae_imputer_on_sample",
     "BaseInterpolator",
     "InterpolationFactory",
+    "build_interpolator_from_config",
     "LinearInterpolator",
     "ForwardFillInterpolator",
     "BackwardFillInterpolator",
@@ -66,4 +81,5 @@ __all__ = [
     "ConstantInterpolator",
     "NoneInterpolator",
     "ModelInterpolator",
+    "MAEInterpolator",
 ]

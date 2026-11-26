@@ -125,6 +125,11 @@ def build_imputer_features(
 # 3. MODEL LOADING & INFERENCE FUNCTIONS
 # =====================================================================
 
+def _resolve_project_path(path: Union[str, Path]) -> Path:
+    p = Path(path)
+    return p if p.is_absolute() else PROJECT_ROOT / p
+
+
 def load_imputer_checkpoint(
     checkpoint_path: Union[str, Path] = "checkpoints/history_imputer_best.pt",
     device: Optional[str] = None,
@@ -133,7 +138,7 @@ def load_imputer_checkpoint(
     Loads trained BiGRUHistoryImputer model and metadata from checkpoint.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt_path = Path(checkpoint_path)
+    ckpt_path = _resolve_project_path(checkpoint_path)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path.resolve()}")
 
@@ -183,7 +188,7 @@ def impute_sequence(
         model, _ = load_imputer_checkpoint(device=device)
 
     if scaler is None:
-        scaler = ArcsinhScaler("DATA/train_multi_output_clear_sky/scaler.json")
+        scaler = ArcsinhScaler(_resolve_project_path("DATA/train_multi_output_clear_sky/scaler.json"))
 
     # Build features
     features = build_imputer_features(h_raw, m_raw, scaler)

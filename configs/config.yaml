@@ -25,7 +25,7 @@ data:
 interpolation:
   # Strategie disponibili nel factory:
   # 'linear', 'forward_fill' (locf), 'backward_fill', 'nearest',
-  # 'spline' (pchip/cubic), 'mean', 'median', 'constant', 'model' (bigru), 'none'
+  # 'spline' (pchip/cubic), 'mean', 'median', 'constant', 'model' (bigru), 'mae', 'none'
   strategy: "linear"
   target_columns: [18, 19, 20]     # Colonne target storiche da interpolare (NDVI, GNDVI, EVI)
   interpolate_weather: true         # Interpola anche eventuali rari buchi nel meteo (0..17)
@@ -33,6 +33,7 @@ interpolation:
   clip_max: 1.0                     # Limite superiore per indici di vegetazione
   spline_kind: "pchip"              # 'pchip' preserva la forma fisica senza overshooting
   model_checkpoint: "checkpoints/history_imputer_best.pt"
+  mae_checkpoint: "checkpoints/mae_imputer_best.pt"
 
 # ---------------------------------------------------------------------
 # Modello di Imputazione del Passato (Bi-GRU Imputer)
@@ -52,6 +53,31 @@ imputer_training:
   weight_decay: 0.0001
   smoothness_weight: 0.05 # Peso della regolarizzazione temporale per evitare salti discontinui
   checkpoint_name: "history_imputer_best.pt"
+
+# ---------------------------------------------------------------------
+# Modello di Imputazione Masked Autoencoder (MAE Transformer Imputer)
+# ---------------------------------------------------------------------
+mae_model:
+  input_dim: 27
+  climate_dim: 8
+  d_model: 64
+  nhead: 4
+  num_encoder_layers: 3
+  num_decoder_layers: 1
+  dim_feedforward: 128
+  output_dim: 3
+  dropout: 0.1
+
+mae_training:
+  epochs: 15
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  smoothness_weight: 0.05
+  visible_recon_weight: 0.25
+  weather_mask_ratio: 0.15
+  weather_recon_weight: 0.1
+  checkpoint_name: "mae_imputer_best.pt"
 
 # ---------------------------------------------------------------------
 # Modello di Forecasting Futuro (Predizione multi-step e probabilistica)

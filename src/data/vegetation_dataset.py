@@ -12,7 +12,7 @@ from torch.utils.data import Dataset
 
 from src.data.transforms import ArcsinhScaler
 from src.data.climate import encode_climate, NUM_CLIMATES
-from src.data.interpolation import InterpolationFactory, BaseInterpolator, LinearInterpolator, ModelInterpolator
+from src.data.interpolation import InterpolationFactory, BaseInterpolator, LinearInterpolator
 
 
 class VegetationDataset(Dataset):
@@ -134,7 +134,7 @@ class VegetationDataset(Dataset):
         # 1. Apply Interpolation Strategy to remove missing values from history targets
         if "history_imputed" in cached:
             h_clean = cached["history_imputed"][s_idx].astype(np.float32).copy()
-        elif isinstance(self.interpolator, ModelInterpolator):
+        elif hasattr(self.interpolator, "interpolate_history_sample"):
             h_clean = self.interpolator.interpolate_history_sample(h_raw, m_raw, raw_climate)
         else:
             h_clean = self.interpolator.interpolate(
