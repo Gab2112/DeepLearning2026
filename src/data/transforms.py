@@ -33,12 +33,14 @@ class ArcsinhScaler:
         self.target_var = np.array(data["target_var"], dtype=np.float32)
         self.target_std = np.sqrt(self.target_var + self.eps).astype(np.float32)
 
-    def transform_features(self, x: np.ndarray) -> np.ndarray:
+    def transform_features(
+        self, x: np.ndarray, *, feature_slice: slice = slice(None)
+    ) -> np.ndarray:
         """
-        x shape: (..., 21) or (..., F)
+        Transform all features, or the columns selected by feature_slice.
         Preserves NaNs.
         """
-        z = (x - self.mean) / self.std
+        z = (x - self.mean[feature_slice]) / self.std[feature_slice]
         return np.arcsinh(z)
 
     def inverse_transform_features(self, y: np.ndarray) -> np.ndarray:

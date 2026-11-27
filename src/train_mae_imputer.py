@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 
 from src.models.bigru_imputer import compute_masked_loss
 from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
+from src.data.weather_preprocessor import configure_imputer_weather
 from src.data.splits import get_train_val_tile_split
 from src.data.transforms import ArcsinhScaler
 from src.models.mae_imputer import MAEHistoryImputer
@@ -56,6 +57,7 @@ def train_mae_imputer(
     device: Optional[str] = None,
 ) -> Path:
     cfg = load_config(config_path)
+    weather = configure_imputer_weather(cfg, "mae_model")
 
     paths_cfg = cfg["paths"]
     data_cfg = cfg["data"]
@@ -67,7 +69,7 @@ def train_mae_imputer(
     target_save_path = (
         Path(save_path)
         if save_path is not None
-        else Path(paths_cfg["checkpoints_dir"]) / t_cfg["checkpoint_name"]
+        else weather.imputer_checkpoint_path(Path(paths_cfg["checkpoints_dir"]) / t_cfg["checkpoint_name"])
     )
 
     num_train_tiles = data_cfg["num_train_tiles"]
@@ -123,6 +125,7 @@ def train_mae_imputer(
         mask_dropout=True,
         climate_dropout_p=climate_dropout_p,
         seed=seed,
+        weather_preprocessor=weather,
     )
     # Honest validation: mask_dropout=True with deterministic seed so val measures
     # true reconstruction error on unseen clear-sky observations.
@@ -133,6 +136,7 @@ def train_mae_imputer(
         mask_dropout=True,
         climate_dropout_p=0.0,
         seed=seed + 1,
+        weather_preprocessor=weather,
     )
     print(f"[*] Train Windows: {len(train_ds):,} | Val Windows: {len(val_ds):,}")
 
@@ -222,10 +226,13 @@ def train_mae_imputer(
             else:
                 vis_loss = torch.tensor(0.0, device=device)
 
-            if weather_recon_weight > 0.0 and torch.any(weather_mask):
+            weather_loss_mask = weather_mask.unsqueeze(-1).expand_as(pred_weather)
+            if weather.uses_masks:
+                weather_loss_mask = weather_loss_mask & batch["weather_reconstruction_mask"].to(device)
+            if weather_recon_weight > 0.0 and torch.any(weather_loss_mask):
                 w_loss = F.smooth_l1_loss(
-                    pred_weather[weather_mask],
-                    x[:, :, :11][weather_mask],
+                    pred_weather[weather_loss_mask],
+                    x[:, :, :11][weather_loss_mask],
                     reduction="mean",
                 )
             else:

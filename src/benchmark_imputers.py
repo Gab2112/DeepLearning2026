@@ -37,9 +37,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.interpolation import InterpolationFactory
+from src.data.interpolation import InterpolationFactory, NoneInterpolator
 from src.data.splits import get_train_val_tile_split
 from src.data.transforms import ArcsinhScaler
+from src.data.weather_preprocessor import WeatherPreprocessor
 from src.train_bigru_imputer import train_bigru_imputer
 from src.train_mae_imputer import train_mae_imputer
 from src.utils.config import load_config
@@ -112,29 +113,24 @@ def evaluate_sample_leave_one_out(
             if interp is None:
                 continue
 
-            try:
-                if hasattr(interp, "interpolate_history_sample"):
-                    imputed = interp.interpolate_history_sample(
-                        pert_h.copy(), pert_m.copy(), climate_str
-                    )
-                else:
-                    imputed = interp.interpolate(
-                        pert_h.copy(), mask=pert_m.copy(), columns=TARGET_COLS
-                    )
+            if hasattr(interp, "interpolate_history_sample"):
+                imputed = interp.interpolate_history_sample(
+                    pert_h.copy(), pert_m.copy(), climate_str
+                )
+            else:
+                imputed = interp.interpolate(
+                    pert_h.copy(), mask=pert_m.copy(), columns=TARGET_COLS
+                )
 
-                pred_vals = imputed[drop_idx, TARGET_COLS]
-                # Replace any unexpected residual NaNs with 0.0 (baseline fallback)
+            pred_vals = imputed[drop_idx, TARGET_COLS]
+            if isinstance(interp, NoneInterpolator):
                 pred_vals = np.nan_to_num(pred_vals, nan=0.0)
+            if not np.isfinite(pred_vals).all():
+                raise ValueError(f"Strategy {strat_key!r} produced non-finite predictions")
 
-                for i, name in enumerate(TARGET_NAMES):
-                    results[strat_key][name][0].append(float(true_vals[i]))
-                    results[strat_key][name][1].append(float(pred_vals[i]))
-
-            except Exception as e:
-                # Fallback to zero in case of unexpected per-sample error
-                for i, name in enumerate(TARGET_NAMES):
-                    results[strat_key][name][0].append(float(true_vals[i]))
-                    results[strat_key][name][1].append(0.0)
+            for i, name in enumerate(TARGET_NAMES):
+                results[strat_key][name][0].append(float(true_vals[i]))
+                results[strat_key][name][1].append(float(pred_vals[i]))
 
     # Convert to numpy arrays
     final_results = {}
@@ -174,6 +170,8 @@ def evaluate_imputation_strategies(
     eval_mode: str = "random_drop",
     device: Optional[str] = None,
     seed: int = 42,
+    *,
+    interpolator_kwargs: Optional[Dict[str, Dict]] = None,
 ) -> pd.DataFrame:
     """
     Evaluates all specified imputation strategies on a given set of tile files.
@@ -189,7 +187,8 @@ def evaluate_imputation_strategies(
             extra_kwargs = {}
             if strat_key in ("model", "bigru", "learned_imputer", "history_imputer", "mae", "mae_imputer", "masked_autoencoder"):
                 extra_kwargs["device"] = device
-                extra_kwargs["strict_checkpoint"] = False
+                extra_kwargs["strict_checkpoint"] = True
+            extra_kwargs.update((interpolator_kwargs or {}).get(strat_key, {}))
 
             interp = InterpolationFactory.create(
                 strat_key,
@@ -300,6 +299,8 @@ def evaluate_imputation_strategies(
         }
         rows.append(row)
 
+    if not rows:
+        raise ValueError("No imputation strategies are available for this benchmark")
     df = pd.DataFrame(rows)
     df = df.sort_values(by="Overall_MAE", ascending=True).reset_index(drop=True)
     df["Rank"] = df.index + 1
@@ -345,6 +346,7 @@ def run_benchmark(
     3. Prints and saves results.
     """
     cfg = load_config(config_path)
+    weather = WeatherPreprocessor(**cfg.get("weather_preprocessing", {}))
     paths_cfg = cfg["paths"]
     data_cfg = cfg["data"]
 
@@ -356,10 +358,12 @@ def run_benchmark(
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[*] Project Root: {PROJECT_ROOT}")
     print(f"[*] Execution Device: {device.upper()}")
+    print(f"[*] Weather profile: {weather.profile} (imputers: {weather.for_imputer().profile})")
 
     # 1. Check if model training is requested or necessary
-    bigru_ckpt = _resolve_path(paths_cfg["checkpoints_dir"]) / cfg["imputer_training"]["checkpoint_name"]
-    mae_ckpt = _resolve_path(paths_cfg["checkpoints_dir"]) / cfg["mae_training"]["checkpoint_name"]
+    checkpoint_dir = _resolve_path(paths_cfg["checkpoints_dir"])
+    bigru_ckpt = weather.imputer_checkpoint_path(checkpoint_dir / cfg["imputer_training"]["checkpoint_name"])
+    mae_ckpt = weather.imputer_checkpoint_path(checkpoint_dir / cfg["mae_training"]["checkpoint_name"])
 
     if not eval_only:
         if train_models or train_bigru_only or (not bigru_ckpt.exists()):
@@ -391,18 +395,27 @@ def run_benchmark(
         eval_mode=eval_mode,
         device=device,
         seed=data_cfg.get("seed", 42),
+        interpolator_kwargs={
+            strategy: {
+                "checkpoint_path": checkpoint_path,
+                "scaler_path": scaler_path,
+                "expected_weather": weather,
+            }
+            for strategy, checkpoint_path in (("bigru", bigru_ckpt), ("mae", mae_ckpt))
+        },
     )
+    df_results["weather_profile"] = weather.profile
 
     # 4. Display Leaderboard
     table = format_leaderboard(df_results)
     print("\n" + table + "\n")
 
-    best_strategy = df_results.iloc[0]
-    print(f"[***] VINCITORE: La strategia migliore per l'imputazione e': {best_strategy['label']} (MAE={best_strategy['Overall_MAE']:.4f}, RMSE={best_strategy['Overall_RMSE']:.4f}) [***]\n")
+    print("[*] Il ranking misura la ricostruzione storica. Il contributo al forecasting richiede una valutazione dedicata.")
 
     # 5. Save artifacts
-    csv_path = results_dir / "imputation_benchmark.csv"
-    json_path = results_dir / "imputation_benchmark.json"
+    suffix = "" if weather.profile == "M0" else f"_{weather.profile.lower()}"
+    csv_path = results_dir / f"imputation_benchmark{suffix}.csv"
+    json_path = results_dir / f"imputation_benchmark{suffix}.json"
 
     df_results.to_csv(csv_path, index=False)
     with open(json_path, "w", encoding="utf-8") as f:

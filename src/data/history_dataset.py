@@ -12,11 +12,20 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Union, Sequence
 import numpy as np
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
 from src.data.transforms import ArcsinhScaler
 from src.data.climate import encode_climate, NUM_CLIMATES
 from src.data.interpolation import InterpolationFactory, BaseInterpolator
+from src.data.weather_preprocessor import WeatherPreprocessor
+
+WEATHER_MASK_KEYS = (
+    "weather_original_missing_mask",
+    "weather_invalid_mask",
+    "weather_mask",
+    "weather_reconstruction_mask",
+)
 
 
 class HistoryImputationDataset(Dataset):
@@ -39,9 +48,11 @@ class HistoryImputationDataset(Dataset):
         interpolation_columns: Optional[Sequence[int]] = (18, 19, 20),
         interpolation_kwargs: Optional[Dict] = None,
         seed: int = 42,
+        weather_preprocessor: Optional[WeatherPreprocessor] = None,
     ):
         super().__init__()
         self.scaler = scaler
+        self.weather_preprocessor = weather_preprocessor or WeatherPreprocessor()
         self.mask_dropout = mask_dropout
         self.climate_dropout_p = climate_dropout_p
         self.interpolation_columns = interpolation_columns
@@ -130,8 +141,7 @@ class HistoryImputationDataset(Dataset):
         L = h_raw.shape[0]
 
         # 1. Feature normalization with ArcsinhScaler
-        norm_weather_calendar = self.scaler.transform_features(h_raw)[:, :18]
-        norm_weather_calendar = np.nan_to_num(norm_weather_calendar, nan=0.0)
+        weather = self.weather_preprocessor.transform(h_raw, m_raw, self.scaler)
 
         # Targets 18..20 (NDVI, GNDVI, EVI)
         targets_raw = h_raw[:, 18:21]
@@ -189,9 +199,10 @@ class HistoryImputationDataset(Dataset):
         delta_t, orbital_phase, missed_revisits = self._compute_orbital_dynamics(input_obs_mask)
         orbital_feats = np.stack([delta_t, orbital_phase, missed_revisits], axis=-1)  # (L, 3)
 
-        # Concatenate full input vector:
-        # [weather_calendar (18), input_targets (3), mask_feature (3), orbital_feats (3)] -> total 27 dims
-        model_input = np.concatenate([norm_weather_calendar, input_targets, mask_feature, orbital_feats], axis=-1)
+        features = [weather.values, input_targets, mask_feature, orbital_feats]
+        if self.weather_preprocessor.uses_masks:
+            features.append(weather.weather_mask)
+        model_input = np.concatenate(features, axis=-1)
         model_input = np.nan_to_num(model_input, nan=0.0)
 
         clean_norm_targets = np.nan_to_num(norm_targets, nan=0.0)
@@ -202,6 +213,10 @@ class HistoryImputationDataset(Dataset):
             "target": torch.from_numpy(clean_norm_targets).float(),
             "loss_mask": torch.from_numpy(eval_supervision_mask).bool(),
             "all_obs_mask": torch.from_numpy(obs_mask).bool(),
+            "weather_original_missing_mask": torch.from_numpy(weather.original_missing),
+            "weather_invalid_mask": torch.from_numpy(weather.invalid),
+            "weather_mask": torch.from_numpy(weather.weather_mask),
+            "weather_reconstruction_mask": torch.from_numpy(weather.available[:, :11]),
             "length": L,
         }
 
@@ -240,4 +255,9 @@ def collate_history_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, tor
         "obs_mask": padded_obs_mask,
         "padding_mask": padding_mask,
         "lengths": torch.tensor(lengths, dtype=torch.long),
+        **{
+            key: pad_sequence([item[key] for item in batch], batch_first=True)
+            for key in WEATHER_MASK_KEYS
+            if key in batch[0]
+        },
     }

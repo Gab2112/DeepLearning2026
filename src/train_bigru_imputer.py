@@ -28,6 +28,7 @@ from src.utils.config import load_config
 from src.data.transforms import ArcsinhScaler
 from src.data.splits import get_train_val_tile_split
 from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
+from src.data.weather_preprocessor import configure_imputer_weather
 from src.models.bigru_imputer import compute_masked_loss
 from src.models.history_imputer import BiGRUHistoryImputer
 
@@ -38,6 +39,7 @@ def train_bigru_imputer(
 ):
     # 1. Caricamento configurazione centralizzata da YAML
     cfg = load_config(config_path)
+    weather = configure_imputer_weather(cfg, "imputer_model")
 
     paths_cfg = cfg["paths"]
     data_cfg = cfg["data"]
@@ -46,7 +48,7 @@ def train_bigru_imputer(
 
     data_dir = paths_cfg["train_data_dir"]
     scaler_path = paths_cfg["scaler_path"]
-    save_path = paths_cfg["checkpoints_dir"] / t_cfg["checkpoint_name"]
+    save_path = weather.imputer_checkpoint_path(paths_cfg["checkpoints_dir"] / t_cfg["checkpoint_name"])
 
     num_train_tiles = data_cfg["num_train_tiles"]
     num_val_tiles = data_cfg["num_val_tiles"]
@@ -105,6 +107,7 @@ def train_bigru_imputer(
         mask_dropout=True,
         climate_dropout_p=climate_dropout_p,
         seed=seed,
+        weather_preprocessor=weather,
     )
     val_ds = HistoryImputationDataset(
         data_dir,
@@ -113,6 +116,7 @@ def train_bigru_imputer(
         mask_dropout=True,
         climate_dropout_p=0.0,
         seed=seed + 1,
+        weather_preprocessor=weather,
     )
     print(f"[*] Campioni Train: {len(train_ds):,} | Campioni Val: {len(val_ds):,}")
 

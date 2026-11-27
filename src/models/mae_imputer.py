@@ -55,12 +55,13 @@ class MAEHistoryImputer(nn.Module):
     """
     Transformer-based Masked Autoencoder for imputing sparse clear-sky vegetation indices.
 
-    Expected input x of shape (B, L, 27):
+    Expected input x of shape (B, L, 27) in M0 or (B, L, 35) with weather masks:
         - [:, :, 0:11]  : normalized weather & cloud covariates (masked during MAE training)
         - [:, :, 11:18] : deterministic day_of_year & Fourier calendar covariates
         - [:, :, 18:21] : sparse normalized target values (NDVI, GNDVI, EVI)
         - [:, :, 21:24] : observation mask flags (1.0 if observed, 0.0 if missing)
         - [:, :, 24:27] : Sentinel-2 orbital dynamics (delta_t, orbital_phase, missed_revisits)
+        - [:, :, 27:35] : optional weather availability flags
     """
 
     def __init__(
@@ -78,8 +79,12 @@ class MAEHistoryImputer(nn.Module):
         super().__init__()
         # Lazy import avoids circular import with src.data
         from src.data.climate import NUM_CLIMATES
+        from src.data.weather_preprocessor import LEGACY_IMPUTER_INPUT_DIM, WEATHER_FEATURE_COUNT
 
         self.input_dim = input_dim
+        self.weather_mask_dim = input_dim - LEGACY_IMPUTER_INPUT_DIM
+        if self.weather_mask_dim not in (0, WEATHER_FEATURE_COUNT):
+            raise ValueError(f"MAE input_dim must be 27 or 35, received {input_dim}")
         self.climate_dim = climate_dim
         self.d_model = d_model
         self.output_dim = output_dim
@@ -87,7 +92,7 @@ class MAEHistoryImputer(nn.Module):
         self.climate_embedding = nn.Embedding(NUM_CLIMATES, climate_dim)
 
         self.weather_proj = nn.Sequential(
-            nn.Linear(11, d_model),
+            nn.Linear(11 + self.weather_mask_dim, d_model),
             nn.LayerNorm(d_model),
             nn.GELU(),
         )
@@ -180,17 +185,21 @@ class MAEHistoryImputer(nn.Module):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
-            x: (B, L, 27)
+            x: (B, L, input_dim)
             climate_id: (B,) integer tensor in [0, NUM_CLIMATES-1]
             padding_mask: (B, L) boolean tensor (True where valid, False where padding)
             weather_mask: optional (B, L) boolean tensor (True where weather tokens are masked)
             return_weather: if True, returns (pred_targets, pred_weather)
         Returns:
-            pred_targets: (B, L, 3) or tuple ((B, L, 3), (B, L, 18))
+            pred_targets: (B, L, 3) or tuple ((B, L, 3), (B, L, 11))
         """
-        B, L, _ = x.shape
+        B, L, input_dim = x.shape
+        if input_dim != self.input_dim:
+            raise ValueError(f"Expected {self.input_dim} history channels, received {input_dim}")
 
         x_weather = x[:, :, :11]
+        if self.weather_mask_dim:
+            x_weather = torch.cat([x_weather, x[:, :, 27:]], dim=-1)
         x_calendar = x[:, :, 11:18]
         x_targets = x[:, :, 18:21]
         x_obs_flags = x[:, :, 21:24]
