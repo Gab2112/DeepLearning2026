@@ -130,3 +130,17 @@ def get_train_val_tile_split(
         "val": val_climate_counts,
     }
     return train_files, val_files, summary
+
+
+def get_experiment_split(cfg: dict) -> Tuple[List[Path], List[Path], Dict[str, Dict[str, int]]]:
+    """Return the same fitting and internal validation tiles for every experiment."""
+    data = cfg["data"]
+    fit_files, validation_files, summary = get_train_val_tile_split(
+        cfg["paths"]["train_data_dir"],
+        num_val_tiles=data.get("num_val_tiles", 14),
+        seed=data.get("seed", 42),
+    )
+    num_fit_tiles = data.get("num_train_tiles", len(fit_files))
+    if not 0 < num_fit_tiles <= len(fit_files):
+        raise ValueError(f"Expected between 1 and {len(fit_files)} fitting tiles, got {num_fit_tiles}")
+    return fit_files[:num_fit_tiles], validation_files, summary

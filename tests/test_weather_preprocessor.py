@@ -105,12 +105,25 @@ class WeatherPreprocessorTests(unittest.TestCase):
         future = WeatherPreprocessor().transform(self.raw, self.mask, self.scaler, future=True)
         self.assertEqual(future.values[1, 3], 0)
 
+    def test_m4_keeps_interpolation_and_marks_original_availability(self):
+        self.raw[:3, 3] = [1, np.nan, 5]
+        self.raw[:, 4] = np.nan
+        self.mask = np.isnan(self.raw)
+        legacy = WeatherPreprocessor("M0").transform(self.raw, self.mask, self.scaler, interpolate_history=True)
+        masked = WeatherPreprocessor("M4").transform(self.raw, self.mask, self.scaler)
+        np.testing.assert_array_equal(masked.values, legacy.values)
+        self.assertFalse(masked.weather_mask[1, 3])
+        self.assertTrue(masked.original_missing[1, 3])
+        self.assertTrue(masked.interpolated[1, 3])
+        self.assertFalse(masked.interpolated[:, 4].any())
+        self.assertFalse(masked.invalid.any())
+
     def test_preserves_future_noise_and_optionally_clips_verified_ranges(self):
         self.raw[0, :11] = [-1, 108, -25, -0.5, 980, 3, 12, 6, -4, 103, 12]
         self.raw[:, 18:] = np.nan
         self.mask = np.isnan(self.raw)
         expected = self.scaler.transform_features(self.raw)[:, :18]
-        for profile in ("M0", "M1", "M2"):
+        for profile in ("M0", "M1", "M2", "M4"):
             with self.subTest(profile=profile):
                 result = WeatherPreprocessor(profile).transform(self.raw, self.mask, self.scaler, future=True)
                 np.testing.assert_array_equal(result.values, expected)
@@ -118,7 +131,7 @@ class WeatherPreprocessorTests(unittest.TestCase):
                 self.assertFalse(result.invalid.any())
 
         clipped = self.raw.copy()
-        clipped[0, :11] = [0, 100, 0, 0, 980, 3, 12, 6, 0, 100, 12]
+        clipped[0, :11] = [0, 100, 0, 0, 980, 3, 12, 6, -4, 103, 12]
         result = WeatherPreprocessor("M3").transform(self.raw[:, :18], self.mask[:, :18], self.scaler, future=True)
         np.testing.assert_array_equal(result.values, self.scaler.transform_features(clipped)[:, :18])
         np.testing.assert_array_equal(result.weather_mask, True)
@@ -163,7 +176,7 @@ class WeatherPreprocessorTests(unittest.TestCase):
         before = path.read_bytes()
         cfg = {"paths": {"train_data_dir": self.directory, "scaler_path": self.scaler_path}}
         targets = LinearInterpolator().interpolate(histories[0], columns=[18, 19, 20])[:, 18:]
-        for profile in ("M0", "M1", "M2", "M3"):
+        for profile in ("M0", "M1", "M2", "M3", "M4"):
             with self.subTest(profile=profile):
                 cfg["weather_preprocessing"] = {"profile": profile}
                 dataset = VegetationDataset.from_config(cfg, file_list=[path])
@@ -175,6 +188,7 @@ class WeatherPreprocessorTests(unittest.TestCase):
                 np.testing.assert_array_equal(sample["history"][:, 18:21], self.scaler.transform_targets(targets))
                 np.testing.assert_array_equal(batch["history_padding_mask"][0], [1, 1, 1, 0, 0])
                 self.assertFalse(batch["history_weather_mask"][0, 3:].any())
+                self.assertFalse(batch["history_weather_interpolated_mask"][0, 3:].any())
                 self.assertFalse(batch["future_weather_mask"][0, 3:].any())
                 self.assertTrue(batch["target_mask"][0, 0, 1:].all())
                 self.assertTrue(torch.isnan(batch["target"][0, 0, 1:]).all())
@@ -274,13 +288,14 @@ class WeatherPreprocessorTests(unittest.TestCase):
         torch.save({"config": model_config, "model_state_dict": model.state_dict()}, checkpoint)
 
         with redirect_stdout(StringIO()) as output:
-            results = run_benchmark(config_path, eval_only=True, max_samples_per_tile=1, device="cpu")
+            results = run_benchmark(config_path, eval_only=True, max_samples_per_tile=1, device="cpu", smoke=True)
 
         self.assertIn("bigru", set(results["strategy"]))
         self.assertNotIn("mae", set(results["strategy"]))
         self.assertIn("MAE checkpoint not found", output.getvalue())
         self.assertEqual(set(results["weather_profile"]), {"M3"})
-        self.assertTrue((self.directory / "imputation_benchmark_m3.csv").is_file())
+        self.assertEqual(set(results["run_kind"]), {"smoke"})
+        self.assertTrue((self.directory / "imputation_benchmark_m3_smoke.csv").is_file())
 
 
 if __name__ == "__main__":

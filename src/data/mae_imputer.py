@@ -29,7 +29,7 @@ from src.models.bigru_imputer import (
     compute_masked_loss,
 )
 from src.data.climate import encode_climate
-from src.data.transforms import ArcsinhScaler
+from src.data.transforms import ArcsinhScaler, scaler_for_imputer
 from src.data.weather_preprocessor import (
     WeatherPreprocessor,
     checkpoint_weather_preprocessor,
@@ -72,6 +72,8 @@ def load_mae_imputer_checkpoint(
 
     model.load_state_dict(ckpt["model_state_dict"])
     model.weather_preprocessor = weather
+    if "scaler" in ckpt:
+        model.arcsinh_scaler = ArcsinhScaler(ckpt["scaler"])
     model.eval()
     return model, ckpt
 
@@ -94,8 +96,7 @@ def impute_sequence_mae(
 
     if model is None:
         model, _ = load_mae_imputer_checkpoint(device=device)
-    if scaler is None:
-        scaler = ArcsinhScaler(_resolve_project_path("DATA/train_multi_output_clear_sky/scaler.json"))
+    scaler = scaler_for_imputer(model, scaler)
 
     features = build_imputer_features(
         h_raw, m_raw, scaler, weather_preprocessor=model_weather_preprocessor(model)
@@ -127,7 +128,7 @@ def impute_batch_sequences_mae(
     masks: List[np.ndarray],
     climates: List[str],
     model: MAEHistoryImputer,
-    scaler: ArcsinhScaler,
+    scaler: Optional[ArcsinhScaler] = None,
     device: Optional[str] = None,
     batch_size: int = 128,
     clip_min: Optional[float] = -1.0,
@@ -138,6 +139,7 @@ def impute_batch_sequences_mae(
     Modifies only missing target entries (columns 18..20) and leaves weather (0..17) untouched.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    scaler = scaler_for_imputer(model, scaler)
     model.eval()
     weather = model_weather_preprocessor(model)
 
@@ -210,6 +212,7 @@ def evaluate_mae_imputer_on_sample(
     preds_all: Dict[str, List[float]] = {n: [] for n in target_names}
     trues_all: Dict[str, List[float]] = {n: [] for n in target_names}
 
+    scaler = scaler_for_imputer(model, scaler)
     model.eval()
     weather = model_weather_preprocessor(model)
     for drop_idx in valid_indices:

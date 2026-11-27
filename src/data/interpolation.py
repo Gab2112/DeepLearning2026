@@ -404,19 +404,24 @@ class ModelInterpolator(BaseInterpolator):
 
         self.model = None
         self.scaler = None
+        self.training_info = None
         self._load_resources(expected_weather)
 
     def _load_resources(self, expected_weather: Optional["WeatherPreprocessor"]):
         from src.data.transforms import ArcsinhScaler
         from src.models.bigru_imputer import load_imputer_checkpoint
 
-        if self.scaler_path.exists():
-            self.scaler = ArcsinhScaler(self.scaler_path)
-
         if self.checkpoint_path.exists():
-            self.model, _ = load_imputer_checkpoint(
+            self.model, checkpoint = load_imputer_checkpoint(
                 self.checkpoint_path, device=self.device, expected_weather=expected_weather
             )
+            if checkpoint.get("optimizer_state_dict", {}).get("state"):
+                self.training_info = checkpoint.get("training")
+            self.scaler = getattr(self.model, "arcsinh_scaler", None)
+            if self.scaler is None and self.scaler_path.exists():
+                self.scaler = ArcsinhScaler(self.scaler_path)
+            if self.scaler is None and self.strict_checkpoint:
+                raise FileNotFoundError(f"No scaler embedded in {self.checkpoint_path} or found at {self.scaler_path}")
         elif self.strict_checkpoint:
             raise FileNotFoundError(f"Bi-GRU checkpoint not found at {self.checkpoint_path}")
         else:
@@ -535,21 +540,26 @@ class MAEInterpolator(BaseInterpolator):
 
         self.model = None
         self.scaler = None
+        self.training_info = None
         self._load_resources(expected_weather)
 
     def _load_resources(self, expected_weather: Optional["WeatherPreprocessor"]):
         from src.data.transforms import ArcsinhScaler
         from src.data.mae_imputer import load_mae_imputer_checkpoint
 
-        if self.scaler_path.exists():
-            self.scaler = ArcsinhScaler(self.scaler_path)
-
         if self.checkpoint_path.exists():
-            self.model, _ = load_mae_imputer_checkpoint(
+            self.model, checkpoint = load_mae_imputer_checkpoint(
                 checkpoint_path=self.checkpoint_path,
                 device=self.device,
                 expected_weather=expected_weather,
             )
+            if checkpoint.get("optimizer_state_dict", {}).get("state"):
+                self.training_info = checkpoint.get("training")
+            self.scaler = getattr(self.model, "arcsinh_scaler", None)
+            if self.scaler is None and self.scaler_path.exists():
+                self.scaler = ArcsinhScaler(self.scaler_path)
+            if self.scaler is None and self.strict_checkpoint:
+                raise FileNotFoundError(f"No scaler embedded in {self.checkpoint_path} or found at {self.scaler_path}")
         elif self.strict_checkpoint:
             raise FileNotFoundError(f"MAE checkpoint not found at {self.checkpoint_path}")
         else:
@@ -625,6 +635,7 @@ def build_interpolator_from_config(
     Instantiates the configured interpolation strategy from configs/config.yaml,
     automatically wiring checkpoint paths, scaler_path, spline_kind, and clip bounds.
     """
+    from src.data.scaler_fit import experiment_checkpoint_path
     from src.data.weather_preprocessor import WeatherPreprocessor
 
     interp_cfg = cfg.get("interpolation", {})
@@ -640,7 +651,7 @@ def build_interpolator_from_config(
         ckpt = interp_cfg.get("mae_checkpoint", "checkpoints/mae_imputer_best.pt")
         return InterpolationFactory.create(
             strategy,
-            checkpoint_path=weather.imputer_checkpoint_path(ckpt),
+            checkpoint_path=experiment_checkpoint_path(cfg, weather, ckpt),
             scaler_path=scaler_path,
             clip_min=clip_min,
             clip_max=clip_max,
@@ -652,7 +663,7 @@ def build_interpolator_from_config(
         ckpt = interp_cfg.get("model_checkpoint", "checkpoints/history_imputer_best.pt")
         return InterpolationFactory.create(
             strategy,
-            checkpoint_path=weather.imputer_checkpoint_path(ckpt),
+            checkpoint_path=experiment_checkpoint_path(cfg, weather, ckpt),
             scaler_path=scaler_path,
             clip_min=clip_min,
             clip_max=clip_max,

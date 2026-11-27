@@ -14,11 +14,13 @@ from torch.utils.data import Dataset
 from src.data.transforms import ArcsinhScaler
 from src.data.climate import encode_climate
 from src.data.interpolation import InterpolationFactory, BaseInterpolator, build_interpolator_from_config
+from src.data.scaler_fit import resolve_experiment_scaler
 from src.data.weather_preprocessor import WeatherPreprocessor
 
 WEATHER_MASK_KEYS = (
     "history_weather_original_missing_mask",
     "history_weather_invalid_mask",
+    "history_weather_interpolated_mask",
     "history_weather_mask",
     "future_weather_original_missing_mask",
     "future_weather_mask",
@@ -138,16 +140,17 @@ class VegetationDataset(Dataset):
         """Build the loader from the project config, defaulting to the official train."""
         paths = cfg["paths"]
         interpolation = cfg.get("interpolation", {})
+        weather = WeatherPreprocessor(**cfg.get("weather_preprocessing", {}))
         return cls(
             data_dir if data_dir is not None else paths["train_data_dir"],
-            ArcsinhScaler(paths["scaler_path"]),
+            resolve_experiment_scaler(cfg, weather),
             file_list=file_list,
             max_files=max_files,
             interpolation_strategy=build_interpolator_from_config(cfg, strict_checkpoint=strict_checkpoint),
             interpolation_columns=interpolation.get("target_columns", (18, 19, 20)),
             interpolate_weather=interpolation.get("interpolate_weather", True),
             seed=cfg.get("data", {}).get("seed", 42),
-            weather_preprocessor=WeatherPreprocessor(**cfg.get("weather_preprocessing", {})),
+            weather_preprocessor=weather,
         )
 
     def __len__(self) -> int:
@@ -211,6 +214,7 @@ class VegetationDataset(Dataset):
             "future_weather": torch.from_numpy(future_weather).float(),
             "history_weather_original_missing_mask": torch.from_numpy(h_weather.original_missing),
             "history_weather_invalid_mask": torch.from_numpy(h_weather.invalid),
+            "history_weather_interpolated_mask": torch.from_numpy(h_weather.interpolated),
             "history_weather_mask": torch.from_numpy(h_weather.weather_mask),
             "future_weather_original_missing_mask": torch.from_numpy(f_weather.original_missing),
             "future_weather_mask": torch.from_numpy(f_weather.weather_mask),

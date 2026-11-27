@@ -38,7 +38,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.interpolation import InterpolationFactory, NoneInterpolator
-from src.data.splits import get_train_val_tile_split
+from src.data.scaler_fit import experiment_checkpoint_path, resolve_experiment_scaler
+from src.data.splits import get_experiment_split
 from src.data.transforms import ArcsinhScaler
 from src.data.weather_preprocessor import WeatherPreprocessor
 from src.train_bigru_imputer import train_bigru_imputer
@@ -72,6 +73,7 @@ def evaluate_sample_leave_one_out(
     scaler: ArcsinhScaler,
     rng: Optional[np.random.RandomState] = None,
     mode: str = "all_obs",
+    inference_seconds: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Dict[str, Tuple[np.ndarray, np.ndarray]]]:
     """
     Evaluates interpolators on a single sequence by masking clear-sky observations.
@@ -83,7 +85,7 @@ def evaluate_sample_leave_one_out(
     Returns:
       Dict mapping strategy_name -> {target_name: (true_values, pred_values)}
     """
-    obs_mask = ~m_raw[:, 18]
+    obs_mask = (~m_raw[:, TARGET_COLS] & np.isfinite(h_raw[:, TARGET_COLS])).all(axis=1)
     valid_indices = np.where(obs_mask)[0]
 
     if len(valid_indices) < 2:
@@ -113,6 +115,7 @@ def evaluate_sample_leave_one_out(
             if interp is None:
                 continue
 
+            start = time.perf_counter()
             if hasattr(interp, "interpolate_history_sample"):
                 imputed = interp.interpolate_history_sample(
                     pert_h.copy(), pert_m.copy(), climate_str
@@ -121,6 +124,8 @@ def evaluate_sample_leave_one_out(
                 imputed = interp.interpolate(
                     pert_h.copy(), mask=pert_m.copy(), columns=TARGET_COLS
                 )
+            if inference_seconds is not None:
+                inference_seconds[strat_key] += time.perf_counter() - start
 
             pred_vals = imputed[drop_idx, TARGET_COLS]
             if isinstance(interp, NoneInterpolator):
@@ -172,6 +177,7 @@ def evaluate_imputation_strategies(
     seed: int = 42,
     *,
     interpolator_kwargs: Optional[Dict[str, Dict]] = None,
+    required_training_epochs: Optional[Dict[str, int]] = None,
 ) -> pd.DataFrame:
     """
     Evaluates all specified imputation strategies on a given set of tile files.
@@ -182,10 +188,12 @@ def evaluate_imputation_strategies(
     # 1. Initialize all interpolator instances via Factory
     print("[*] Initializing interpolation strategies...")
     interpolators: Dict[str, any] = {}
+    training_seconds = {}
     for strat_key, strat_label in strategies:
         try:
             extra_kwargs = {}
-            if strat_key in ("model", "bigru", "learned_imputer", "history_imputer", "mae", "mae_imputer", "masked_autoencoder"):
+            learned = strat_key in ("model", "bigru", "learned_imputer", "history_imputer", "mae", "mae_imputer", "masked_autoencoder")
+            if learned:
                 extra_kwargs["device"] = device
                 extra_kwargs["strict_checkpoint"] = True
             extra_kwargs.update((interpolator_kwargs or {}).get(strat_key, {}))
@@ -194,9 +202,15 @@ def evaluate_imputation_strategies(
                 strat_key,
                 **extra_kwargs,
             )
+            if learned and required_training_epochs is not None:
+                _check_training(strat_key, interp, scaler, seed, required_training_epochs[strat_key])
+            training = getattr(interp, "training_info", None)
+            training_seconds[strat_key] = training["seconds"] if training else (None if learned else 0)
             interpolators[strat_key] = interp
             print(f"  [+] Loaded strategy: {strat_label:<28} (key: {strat_key})")
         except Exception as e:
+            if required_training_epochs is not None:
+                raise RuntimeError(f"Cannot benchmark strategy {strat_key!r}: {e}") from e
             print(f"  [!] Could not load strategy '{strat_key}': {e}. Skipping.")
             interpolators[strat_key] = None
 
@@ -210,10 +224,11 @@ def evaluate_imputation_strategies(
     # 2. Iterate through files and evaluate
     total_samples = 0
     total_eval_points = 0
+    inference_seconds = dict.fromkeys(aggregated, 0.0)
     t0 = time.time()
 
     print(f"\n[*] Evaluating on {len(file_list)} tile files (mode: {eval_mode})...")
-    for f_idx, fpath in enumerate(file_list):
+    for f_idx, fpath in enumerate(sorted(file_list)):
         with np.load(fpath, allow_pickle=True) as d:
             histories = d["history"]
             masks = d["history_mask"]
@@ -236,6 +251,7 @@ def evaluate_imputation_strategies(
                     scaler=scaler,
                     rng=rng,
                     mode=eval_mode,
+                    inference_seconds=inference_seconds,
                 )
 
                 if not sample_res:
@@ -292,10 +308,16 @@ def evaluate_imputation_strategies(
             "Overall_WMAPE": overall_m["WMAPE"],
             "NDVI_MAE": per_index_metrics["NDVI"]["MAE"],
             "NDVI_RMSE": per_index_metrics["NDVI"]["RMSE"],
+            "NDVI_WMAPE": per_index_metrics["NDVI"]["WMAPE"],
             "GNDVI_MAE": per_index_metrics["GNDVI"]["MAE"],
             "GNDVI_RMSE": per_index_metrics["GNDVI"]["RMSE"],
+            "GNDVI_WMAPE": per_index_metrics["GNDVI"]["WMAPE"],
             "EVI_MAE": per_index_metrics["EVI"]["MAE"],
             "EVI_RMSE": per_index_metrics["EVI"]["RMSE"],
+            "EVI_WMAPE": per_index_metrics["EVI"]["WMAPE"],
+            "TrainingSeconds": training_seconds[strat_key],
+            "InferenceSeconds": inference_seconds[strat_key],
+            "MaskedDates": total_eval_points,
         }
         rows.append(row)
 
@@ -306,6 +328,22 @@ def evaluate_imputation_strategies(
     df["Rank"] = df.index + 1
 
     return df
+
+
+def _check_training(strategy, interpolator, scaler: ArcsinhScaler, seed: int, epochs: int) -> None:
+    training = interpolator.training_info
+    if (
+        not training
+        or training.get("completed_epochs", 0) != epochs
+        or training.get("optimizer_steps", 0) <= 0
+        or not np.isfinite(training.get("seconds", 0))
+        or training.get("seconds", 0) <= 0
+        or training.get("seed") != seed
+    ):
+        raise ValueError(f"{strategy} checkpoint lacks a completed training run for the configured epochs and seed")
+    embedded_scaler = getattr(interpolator.model, "arcsinh_scaler", None)
+    if embedded_scaler is None or embedded_scaler.to_dict() != scaler.to_dict():
+        raise ValueError(f"{strategy} checkpoint scaler does not match the configured fitting split")
 
 
 def format_leaderboard(df: pd.DataFrame) -> str:
@@ -338,6 +376,7 @@ def run_benchmark(
     eval_mode: str = "random_drop",
     use_val_split_only: bool = True,
     device: Optional[str] = None,
+    smoke: bool = False,
 ) -> pd.DataFrame:
     """
     Main benchmark execution function:
@@ -350,7 +389,6 @@ def run_benchmark(
     paths_cfg = cfg["paths"]
     data_cfg = cfg["data"]
 
-    train_data_dir = _resolve_path(paths_cfg["train_data_dir"])
     scaler_path = _resolve_path(paths_cfg["scaler_path"])
     results_dir = _resolve_path(paths_cfg["results_dir"])
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -358,34 +396,36 @@ def run_benchmark(
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[*] Project Root: {PROJECT_ROOT}")
     print(f"[*] Execution Device: {device.upper()}")
-    print(f"[*] Weather profile: {weather.profile} (imputers: {weather.for_imputer().profile})")
+    print(f"[*] {'SMOKE TEST' if smoke else 'EXPERIMENT'} — weather profile {weather.profile}")
+    if not smoke and (max_samples_per_tile is not None or not use_val_split_only):
+        raise ValueError("Use --smoke for sample caps or evaluation on the full train")
+    if not smoke and cfg.get("scaling", {}).get("mode") != "fitting_tiles":
+        raise ValueError("The definitive benchmark requires a scaler fitted on the fitting tiles")
+    if (smoke or eval_only) and (train_models or train_bigru_only or train_mae_only):
+        raise ValueError("Smoke and evaluation-only runs do not train models")
 
-    # 1. Check if model training is requested or necessary
+    # 1. Train only when requested explicitly.
     checkpoint_dir = _resolve_path(paths_cfg["checkpoints_dir"])
-    bigru_ckpt = weather.imputer_checkpoint_path(checkpoint_dir / cfg["imputer_training"]["checkpoint_name"])
-    mae_ckpt = weather.imputer_checkpoint_path(checkpoint_dir / cfg["mae_training"]["checkpoint_name"])
+    bigru_ckpt = experiment_checkpoint_path(cfg, weather, checkpoint_dir / cfg["imputer_training"]["checkpoint_name"])
+    mae_ckpt = experiment_checkpoint_path(cfg, weather, checkpoint_dir / cfg["mae_training"]["checkpoint_name"])
 
-    if not eval_only:
-        if train_models or train_bigru_only or (not bigru_ckpt.exists()):
-            print(f"\n{'='*70}\n[+] TRAINING BI-GRU HISTORY IMPUTER\n{'='*70}")
-            train_bigru_imputer(config_path=config_path, device=device)
-
-        if train_models or train_mae_only or (not mae_ckpt.exists()):
-            print(f"\n{'='*70}\n[+] TRAINING MAE HISTORY IMPUTER\n{'='*70}")
-            train_mae_imputer(config_path=config_path, device=device)
+    if train_models or train_bigru_only:
+        train_bigru_imputer(config_path=config_path, device=device)
+    if train_models or train_mae_only:
+        train_mae_imputer(config_path=config_path, device=device)
+    if not smoke:
+        missing = [str(path) for path in (bigru_ckpt, mae_ckpt) if not path.is_file()]
+        if missing:
+            raise FileNotFoundError("Required trained checkpoints missing: " + ", ".join(missing))
 
     # 2. Dataset partitioning (stratified by climate, zero spatial leakage)
-    train_tiles, val_tiles, summary = get_train_val_tile_split(
-        train_data_dir,
-        num_val_tiles=data_cfg.get("num_val_tiles", 14),
-        seed=data_cfg.get("seed", 42),
-    )
+    train_tiles, val_tiles, _ = get_experiment_split(cfg)
 
     eval_files = val_tiles if use_val_split_only else (train_tiles + val_tiles)
-    split_name = "Held-out Validation Split (14 stratified tiles)" if use_val_split_only else "Full Train Dataset (84 tiles)"
+    split_name = "Internal stratified validation" if use_val_split_only else "Full train"
     print(f"\n[*] Evaluating on: {split_name} ({len(eval_files)} tiles)")
 
-    scaler = ArcsinhScaler(scaler_path)
+    scaler = resolve_experiment_scaler(cfg, weather, train_tiles, val_tiles)
 
     # 3. Run Benchmark
     df_results = evaluate_imputation_strategies(
@@ -403,8 +443,16 @@ def run_benchmark(
             }
             for strategy, checkpoint_path in (("bigru", bigru_ckpt), ("mae", mae_ckpt))
         },
+        required_training_epochs=None if smoke else {
+            "bigru": int(cfg["imputer_training"]["epochs"]),
+            "mae": int(cfg["mae_training"]["epochs"]),
+        },
     )
     df_results["weather_profile"] = weather.profile
+    df_results["run_kind"] = "smoke" if smoke else "experiment"
+    df_results["seed"] = data_cfg.get("seed", 42)
+    df_results["eval_mode"] = eval_mode
+    df_results["tiles"] = ",".join(path.stem for path in sorted(eval_files))
 
     # 4. Display Leaderboard
     table = format_leaderboard(df_results)
@@ -414,6 +462,7 @@ def run_benchmark(
 
     # 5. Save artifacts
     suffix = "" if weather.profile == "M0" else f"_{weather.profile.lower()}"
+    suffix += "_smoke" if smoke else "_fit"
     csv_path = results_dir / f"imputation_benchmark{suffix}.csv"
     json_path = results_dir / f"imputation_benchmark{suffix}.json"
 
@@ -437,6 +486,7 @@ def main():
     parser.add_argument("--train-bigru", action="store_true", help="Train Bi-GRU before benchmarking")
     parser.add_argument("--train-mae", action="store_true", help="Train MAE before benchmarking")
     parser.add_argument("--eval-only", action="store_true", help="Evaluate existing checkpoints without re-training")
+    parser.add_argument("--smoke", action="store_true", help="Test pipeline execution and label outputs as smoke results")
     parser.add_argument("--full-dataset", action="store_true", help="Evaluate on all 84 tiles instead of just the 14 val tiles")
     parser.add_argument("--max-samples-per-tile", type=int, default=None, help="Cap samples per tile for rapid benchmarking")
     parser.add_argument("--eval-mode", type=str, choices=["random_drop", "all_obs"], default="random_drop",
@@ -456,6 +506,7 @@ def main():
         eval_mode=args.eval_mode,
         use_val_split_only=not args.full_dataset,
         device=args.device,
+        smoke=args.smoke,
     )
 
 

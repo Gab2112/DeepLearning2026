@@ -1,11 +1,17 @@
 # Briefing di progetto — *Forecasting vegetation health from satellite time series*
 
-**Fonte:** [DL_Project.pdf](file:///c:/Users/Daniele/Desktop/Progetto%20Deep%20Learning/DeepLearning2026/DL_Project.pdf) (7 slide).
+**Fonte:** [DL_Project.pdf](DL_Project.pdf) (7 slide).
 
 > [!NOTE]
-> Il briefing si basa **solo sul PDF**. In alcuni punti il [README dei dati](file:///c:/Users/Daniele/Desktop/Progetto%20Deep%20Learning/DeepLearning2026/DATA/README.md) dà dettagli in più. Quando li uso, li segno con 📎 **README** per non confonderli con il contenuto delle slide.
+> Il briefing si basa **solo sul PDF**. In alcuni punti il [README dei dati](DATA/README.md) dà dettagli in più. Quando li uso, li segno con 📎 **README** per non confonderli con il contenuto delle slide.
 
-La configurazione corrente e i profili meteorologici M0–M3 sono descritti nel [README della repository](README.md#profili-meteorologici). L'interpolazione lineare è la strategia predefinita per gli indici storici. Bi-GRU, MAE e le altre strategie sono candidate da confrontare anche in base al contributo al forecasting finale.
+### Stato dell'implementazione
+
+La slide 5 consente la normalizzazione con uno scaler proprio. Il protocollo implementato stima lo scaler Arcsinh sui 70 tile di fitting e lo riusa sui 14 tile di validation, con split stratificato per clima e seed 42. I checkpoint registrano le statistiche effettive. Gli split ID, OOD-S e OOD-T sono riservati alla valutazione finale.
+
+La configurazione corrente comprende M0–M4. M4 conserva l'interpolazione meteo storica e aggiunge flag basati sulla disponibilità precedente all'interpolazione. Il clipping delle frazioni nuvolose è sospeso in attesa della documentazione della scala delle colonne aggregate. Le verifiche sul train hanno individuato 852 misure finite e originariamente disponibili invalidate dal controllo termico. [Profili nel README](README.md#profili-meteorologici) · [Audit del train](results/weather_qc_train.csv)
+
+Le ipotesi di ablazione confrontano i profili meteo con imputatore fisso, poi gli imputatori con meteo fisso. L'interpolazione lineare è il default. Bi-GRU, MAE e gli altri candidati restano da confrontare sul forecasting con pinball loss, MAE della mediana e calibrazione. I test e gli smoke test verificano l'esecuzione. Le misure del benchmark definitivo richiedono checkpoint addestrati e il confronto sul forecasting richiede il forecaster. [Comandi e limiti](README.md#uso-e-verifica)
 
 ---
 

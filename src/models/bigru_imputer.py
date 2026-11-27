@@ -152,6 +152,7 @@ def load_imputer_checkpoint(
         raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path.resolve()}")
 
     from src.data.weather_preprocessor import checkpoint_weather_preprocessor
+    from src.data.transforms import ArcsinhScaler
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     config = ckpt.get("config", {})
@@ -170,6 +171,8 @@ def load_imputer_checkpoint(
 
     model.load_state_dict(ckpt["model_state_dict"])
     model.weather_preprocessor = weather
+    if "scaler" in ckpt:
+        model.arcsinh_scaler = ArcsinhScaler(ckpt["scaler"])
     model.eval()
     return model, ckpt
 
@@ -195,9 +198,9 @@ def impute_sequence(
     if model is None:
         model, _ = load_imputer_checkpoint(device=device)
 
-    if scaler is None:
-        from src.data.transforms import ArcsinhScaler
-        scaler = ArcsinhScaler(_resolve_project_path("DATA/train_multi_output_clear_sky/scaler.json"))
+    from src.data.transforms import scaler_for_imputer
+
+    scaler = scaler_for_imputer(model, scaler)
 
     # Build features
     from src.data.climate import encode_climate
@@ -233,7 +236,7 @@ def impute_batch_sequences(
     masks: List[np.ndarray],
     climates: List[str],
     model: BiGRUHistoryImputer,
-    scaler: ArcsinhScaler,
+    scaler: Optional[ArcsinhScaler] = None,
     device: Optional[str] = None,
     batch_size: int = 64,
     clip_min: Optional[float] = -1.0,
@@ -244,8 +247,10 @@ def impute_batch_sequences(
     Only modifies missing target columns (18..20) and leaves weather columns (0..17) untouched.
     """
     from src.data.weather_preprocessor import model_weather_preprocessor
+    from src.data.transforms import scaler_for_imputer
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    scaler = scaler_for_imputer(model, scaler)
     model.eval()
     weather = model_weather_preprocessor(model)
 
@@ -371,8 +376,10 @@ def evaluate_imputer_on_sample(
     target_names = ["NDVI", "GNDVI", "EVI"]
 
     from src.data.climate import encode_climate
+    from src.data.transforms import scaler_for_imputer
     from src.data.weather_preprocessor import model_weather_preprocessor
 
+    scaler = scaler_for_imputer(model, scaler)
     weather = model_weather_preprocessor(model)
     for drop_idx in valid_indices:
         perturbed_mask = obs_mask.copy()
@@ -460,8 +467,7 @@ def main():
                         help="Execution mode: test (impute 1 sample), evaluate (leave-one-out metrics), or train")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/history_imputer_best.pt",
                         help="Path to trained imputer checkpoint")
-    parser.add_argument("--scaler", type=str, default="DATA/train_multi_output_clear_sky/scaler.json",
-                        help="Path to scaler.json")
+    parser.add_argument("--scaler", type=str, default=None, help="Scaler path for legacy checkpoints")
     parser.add_argument("--config", type=str, default="configs/config.yaml",
                         help="Path to config.yaml")
     args = parser.parse_args()
@@ -473,9 +479,9 @@ def main():
         return
 
     # For test and evaluate, load sample data
-    from src.data.transforms import ArcsinhScaler
-    scaler = ArcsinhScaler(args.scaler)
+    from src.data.transforms import ArcsinhScaler, scaler_for_imputer
     model, _ = load_imputer_checkpoint(args.checkpoint, device=device)
+    scaler = scaler_for_imputer(model, ArcsinhScaler(args.scaler) if args.scaler else None)
 
     data_files = sorted(list(Path("DATA/train_multi_output_clear_sky").glob("*.npz")))
     if not data_files:

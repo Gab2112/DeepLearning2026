@@ -12,6 +12,9 @@ paths:
   checkpoints_dir: "checkpoints"
   results_dir: "results"
 
+scaling:
+  mode: "fitting_tiles"  # "distributed" is available for legacy checkpoints
+
 data:
   seed: 42
   # Partizionamento per Tile nello split di train (per evitare data leakage)
@@ -36,7 +39,8 @@ interpolation:
   mae_checkpoint: "checkpoints/mae_imputer_best.pt"
 
 # M0: pipeline originale. M1: zero filling + maschere.
-# M2: M1 + cleaning storico. M3: M2 + clipping delle covariate future.
+# M2: M1 + cleaning storico. M3: M2 + clipping meteo futuro.
+# M4: interpolazione storica di M0 + maschere originali, futuro di M1.
 weather_preprocessing:
   profile: "M0"
   temperature_tolerance_c: 1.0     # Soglia sperimentale per le inversioni termiche
@@ -46,7 +50,7 @@ weather_preprocessing:
 # Modello di Imputazione del Passato (Bi-GRU Imputer)
 # ---------------------------------------------------------------------
 imputer_model:
-  input_dim: 27           # M0. La configurazione effettiva usa 35 canali con M1/M2/M3
+  input_dim: 27           # M0. La configurazione effettiva usa 35 canali con M1–M4
   climate_dim: 8          # Dimensione dell'embedding per le classi climatiche di Köppen
   hidden_dim: 64
   num_layers: 2
@@ -65,7 +69,7 @@ imputer_training:
 # Modello di Imputazione Masked Autoencoder (MAE Transformer Imputer)
 # ---------------------------------------------------------------------
 mae_model:
-  input_dim: 27           # M0. La configurazione effettiva usa 35 canali con M1/M2/M3
+  input_dim: 27           # M0. La configurazione effettiva usa 35 canali con M1–M4
   climate_dim: 8
   d_model: 64
   nhead: 4

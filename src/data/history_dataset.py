@@ -23,6 +23,7 @@ from src.data.weather_preprocessor import WeatherPreprocessor
 WEATHER_MASK_KEYS = (
     "weather_original_missing_mask",
     "weather_invalid_mask",
+    "weather_interpolated_mask",
     "weather_mask",
     "weather_reconstruction_mask",
 )
@@ -215,6 +216,7 @@ class HistoryImputationDataset(Dataset):
             "all_obs_mask": torch.from_numpy(obs_mask).bool(),
             "weather_original_missing_mask": torch.from_numpy(weather.original_missing),
             "weather_invalid_mask": torch.from_numpy(weather.invalid),
+            "weather_interpolated_mask": torch.from_numpy(weather.interpolated),
             "weather_mask": torch.from_numpy(weather.weather_mask),
             "weather_reconstruction_mask": torch.from_numpy(weather.available[:, :11]),
             "length": L,

@@ -3,7 +3,7 @@ Training and Validation Pipeline for the Bi-GRU Past Time-Series Imputer.
 Configured centrally via configs/config.yaml.
 Executes:
 1. Spatial Tile-based Train/Val splitting.
-2. ArcsinhScaler normalization using existing train scaler.json.
+2. ArcsinhScaler normalization fitted on the fitting tiles.
 3. Sentinel-2 5-day orbital revisit dynamics + Climate Embedding.
 4. Self-supervised training with masked reconstruction loss + smoothness penalty.
 5. Checkpointing and evaluation on original scale.
@@ -25,12 +25,13 @@ from torch.utils.data import DataLoader
 import numpy as np
 
 from src.utils.config import load_config
-from src.data.transforms import ArcsinhScaler
-from src.data.splits import get_train_val_tile_split
+from src.data.scaler_fit import experiment_checkpoint_path, resolve_experiment_scaler
+from src.data.splits import get_experiment_split
 from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
 from src.data.weather_preprocessor import configure_imputer_weather
 from src.models.bigru_imputer import compute_masked_loss
 from src.models.history_imputer import BiGRUHistoryImputer
+from src.utils.checkpoints import complete_training_checkpoint
 
 
 def train_bigru_imputer(
@@ -47,13 +48,12 @@ def train_bigru_imputer(
     t_cfg = cfg["imputer_training"]
 
     data_dir = paths_cfg["train_data_dir"]
-    scaler_path = paths_cfg["scaler_path"]
-    save_path = weather.imputer_checkpoint_path(paths_cfg["checkpoints_dir"] / t_cfg["checkpoint_name"])
+    save_path = experiment_checkpoint_path(cfg, weather, paths_cfg["checkpoints_dir"] / t_cfg["checkpoint_name"])
 
-    num_train_tiles = data_cfg["num_train_tiles"]
-    num_val_tiles = data_cfg["num_val_tiles"]
     climate_dropout_p = data_cfg["climate_dropout_p"]
     seed = data_cfg["seed"]
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
     epochs = t_cfg["epochs"]
     batch_size = t_cfg["batch_size"]
@@ -74,29 +74,13 @@ def train_bigru_imputer(
     print(f"[*] Checkpoint Target: {save_path}")
 
     # 2. Tile Partitioning (Split geografico disgiunto e stratificato per clima)
-    all_files = sorted(list(data_dir.glob("*.npz")))
-    if len(all_files) == 0:
-        raise FileNotFoundError(f"Nessun file .npz trovato nella cartella:\n  {data_dir.resolve()}")
-
-    required_tiles = num_train_tiles + num_val_tiles
-    if len(all_files) < required_tiles:
-        raise ValueError(
-            f"Trovati {len(all_files)} file .npz in {data_dir}, ma ne sono richiesti almeno {required_tiles} "
-            f"(train={num_train_tiles}, val={num_val_tiles})."
-        )
-
-    train_files, val_files, split_summary = get_train_val_tile_split(
-        data_dir, num_val_tiles=num_val_tiles, seed=seed
-    )
-    if num_train_tiles < len(train_files):
-        train_files = train_files[:num_train_tiles]
-    print(f"[*] Train Tiles: {len(train_files)} | Val Tiles: {len(val_files)} (su {len(all_files)} totali)")
+    train_files, val_files, split_summary = get_experiment_split(cfg)
+    print(f"[*] Train Tiles: {len(train_files)} | Val Tiles: {len(val_files)}")
     print(f"[*] Climi Train: {split_summary['train']}")
     print(f"[*] Climi Val  : {split_summary['val']}")
 
     # 3. Scaler
-    scaler = ArcsinhScaler(scaler_path)
-    print(f"[*] Scaler caricato da: {scaler_path}")
+    scaler = resolve_experiment_scaler(cfg, weather, train_files, val_files)
 
     # 4. Datasets & Loaders
     print("[*] Indicizzazione dataset in corso...")
@@ -143,6 +127,8 @@ def train_bigru_imputer(
     print(" INIZIO CICLO DI ADDESTRAMENTO")
     print("-" * 65)
 
+    training_start = time.perf_counter()
+    optimizer_steps = 0
     for epoch in range(1, epochs + 1):
         t0 = time.time()
         model.train()
@@ -166,6 +152,7 @@ def train_bigru_imputer(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            optimizer_steps += 1
 
             total_train_loss += loss.item()
             total_train_recon += recon_loss.item()
@@ -224,6 +211,7 @@ def train_bigru_imputer(
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "config": cfg,
+                "scaler": scaler.to_dict(),
                 "val_loss": best_val_loss,
                 "val_mae_orig": avg_val_mae,
                 "val_mae_per_index": per_idx_mae,
@@ -235,12 +223,16 @@ def train_bigru_imputer(
               f"Train Loss: {avg_train_loss:.4f} (Recon: {avg_train_recon:.4f}) | "
               f"Val Loss: {avg_val_loss:.4f} | Val MAE: {avg_val_mae:.4f} [{idx_str}]{flag}")
 
+    if best_val_loss == float("inf") or optimizer_steps == 0:
+        raise RuntimeError("Training produced no usable Bi-GRU checkpoint")
+    best_ckpt = complete_training_checkpoint(
+        save_path, epochs=epochs, optimizer_steps=optimizer_steps,
+        seconds=time.perf_counter() - training_start, seed=seed,
+    )
+    model.load_state_dict(best_ckpt["model_state_dict"])
+
     print("-" * 65)
     print(f"[*] Training completato! Miglior checkpoint salvato in:\n    {save_path}")
-
-    if save_path.exists():
-        best_ckpt = torch.load(save_path, map_location=device, weights_only=False)
-        model.load_state_dict(best_ckpt["model_state_dict"])
 
     val_ds.rng = np.random.RandomState(seed + 1)
     # Dimostrazione pratica su un campione di validazione
