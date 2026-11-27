@@ -20,7 +20,8 @@ class BiGRUHistoryImputer(nn.Module):
         - 3 sparse normalized target values
         - 3 observation mask indicators (1 = observed, 0 = missing)
         - 3 orbital dynamics features (delta_t, orbital_phase (t % 5)/5, missed_5d_revisits)
-        Total input_dim = 27
+        - 8 optional weather availability flags
+        Total input_dim = 27 (M0) or 35 (M1/M2/M3).
     Climate Embedding:
         - 9 classes (0 = <UNKNOWN>, 1..8 = Köppen classes) -> mapped to 8-dim embedding
     Output dims:
@@ -39,6 +40,7 @@ class BiGRUHistoryImputer(nn.Module):
         super().__init__()
         from src.data.climate import NUM_CLIMATES
 
+        self.input_dim = input_dim
         self.climate_embedding = nn.Embedding(NUM_CLIMATES, climate_dim)
 
         self.input_proj = nn.Sequential(
@@ -78,7 +80,9 @@ class BiGRUHistoryImputer(nn.Module):
         Returns:
             pred_targets: (Batch, Seq_len, 3) daily reconstructed normalized targets
         """
-        B, L, _ = x.shape
+        B, L, input_dim = x.shape
+        if input_dim != self.input_dim:
+            raise ValueError(f"Expected {self.input_dim} history channels, received {input_dim}")
 
         if climate_id is not None:
             # (B, climate_dim) -> expand to (B, L, climate_dim)

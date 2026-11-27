@@ -5,12 +5,15 @@ Spline/PCHIP, Mean, Median, Constant/Zero, and Model-based (Bi-GRU).
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Sequence, Type, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Type, Union
 from pathlib import Path
 import warnings
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from src.data.weather_preprocessor import WeatherPreprocessor
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -391,6 +394,7 @@ class ModelInterpolator(BaseInterpolator):
         clip_max: Optional[float] = 1.0,
         fill_value: float = 0.0,
         strict_checkpoint: bool = False,
+        expected_weather: Optional["WeatherPreprocessor"] = None,
     ):
         super().__init__(clip_min=clip_min, clip_max=clip_max, fill_value=fill_value)
         self.checkpoint_path = _resolve_project_path(checkpoint_path)
@@ -400,41 +404,24 @@ class ModelInterpolator(BaseInterpolator):
 
         self.model = None
         self.scaler = None
-        self._load_resources()
+        self.training_info = None
+        self._load_resources(expected_weather)
 
-    def _load_resources(self):
-        import sys
-        import pathlib
-        if "pathlib._local" not in sys.modules:
-            sys.modules["pathlib._local"] = pathlib
-
+    def _load_resources(self, expected_weather: Optional["WeatherPreprocessor"]):
         from src.data.transforms import ArcsinhScaler
-        from src.models.history_imputer import BiGRUHistoryImputer
-
-        if self.scaler_path.exists():
-            self.scaler = ArcsinhScaler(self.scaler_path)
+        from src.models.bigru_imputer import load_imputer_checkpoint
 
         if self.checkpoint_path.exists():
-            ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
-            m_cfg = ckpt.get("config", {}).get("imputer_model", {
-                "input_dim": 27,
-                "climate_dim": 8,
-                "hidden_dim": 64,
-                "num_layers": 2,
-                "output_dim": 3,
-                "dropout": 0.1,
-            })
-            self.model = BiGRUHistoryImputer(
-                input_dim=m_cfg.get("input_dim", 27),
-                climate_dim=m_cfg.get("climate_dim", 8),
-                hidden_dim=m_cfg.get("hidden_dim", 64),
-                num_layers=m_cfg.get("num_layers", 2),
-                output_dim=m_cfg.get("output_dim", 3),
-                dropout=m_cfg.get("dropout", 0.1),
-            ).to(self.device)
-
-            self.model.load_state_dict(ckpt["model_state_dict"])
-            self.model.eval()
+            self.model, checkpoint = load_imputer_checkpoint(
+                self.checkpoint_path, device=self.device, expected_weather=expected_weather
+            )
+            if checkpoint.get("optimizer_state_dict", {}).get("state"):
+                self.training_info = checkpoint.get("training")
+            self.scaler = getattr(self.model, "arcsinh_scaler", None)
+            if self.scaler is None and self.scaler_path.exists():
+                self.scaler = ArcsinhScaler(self.scaler_path)
+            if self.scaler is None and self.strict_checkpoint:
+                raise FileNotFoundError(f"No scaler embedded in {self.checkpoint_path} or found at {self.scaler_path}")
         elif self.strict_checkpoint:
             raise FileNotFoundError(f"Bi-GRU checkpoint not found at {self.checkpoint_path}")
         else:
@@ -468,8 +455,11 @@ class ModelInterpolator(BaseInterpolator):
 
         from src.models.bigru_imputer import build_imputer_features
         from src.data.climate import encode_climate
+        from src.data.weather_preprocessor import model_weather_preprocessor
 
-        model_input = build_imputer_features(h_raw, m_raw, self.scaler)
+        model_input = build_imputer_features(
+            h_raw, m_raw, self.scaler, weather_preprocessor=model_weather_preprocessor(self.model)
+        )
         climate_id = encode_climate(climate_str)
 
         x_t = torch.from_numpy(model_input).float().unsqueeze(0).to(self.device)
@@ -540,6 +530,7 @@ class MAEInterpolator(BaseInterpolator):
         clip_max: Optional[float] = 1.0,
         fill_value: float = 0.0,
         strict_checkpoint: bool = False,
+        expected_weather: Optional["WeatherPreprocessor"] = None,
     ):
         super().__init__(clip_min=clip_min, clip_max=clip_max, fill_value=fill_value)
         self.checkpoint_path = _resolve_project_path(checkpoint_path)
@@ -549,20 +540,26 @@ class MAEInterpolator(BaseInterpolator):
 
         self.model = None
         self.scaler = None
-        self._load_resources()
+        self.training_info = None
+        self._load_resources(expected_weather)
 
-    def _load_resources(self):
+    def _load_resources(self, expected_weather: Optional["WeatherPreprocessor"]):
         from src.data.transforms import ArcsinhScaler
         from src.data.mae_imputer import load_mae_imputer_checkpoint
 
-        if self.scaler_path.exists():
-            self.scaler = ArcsinhScaler(self.scaler_path)
-
         if self.checkpoint_path.exists():
-            self.model, _ = load_mae_imputer_checkpoint(
+            self.model, checkpoint = load_mae_imputer_checkpoint(
                 checkpoint_path=self.checkpoint_path,
                 device=self.device,
+                expected_weather=expected_weather,
             )
+            if checkpoint.get("optimizer_state_dict", {}).get("state"):
+                self.training_info = checkpoint.get("training")
+            self.scaler = getattr(self.model, "arcsinh_scaler", None)
+            if self.scaler is None and self.scaler_path.exists():
+                self.scaler = ArcsinhScaler(self.scaler_path)
+            if self.scaler is None and self.strict_checkpoint:
+                raise FileNotFoundError(f"No scaler embedded in {self.checkpoint_path} or found at {self.scaler_path}")
         elif self.strict_checkpoint:
             raise FileNotFoundError(f"MAE checkpoint not found at {self.checkpoint_path}")
         else:
@@ -638,6 +635,9 @@ def build_interpolator_from_config(
     Instantiates the configured interpolation strategy from configs/config.yaml,
     automatically wiring checkpoint paths, scaler_path, spline_kind, and clip bounds.
     """
+    from src.data.scaler_fit import experiment_checkpoint_path
+    from src.data.weather_preprocessor import WeatherPreprocessor
+
     interp_cfg = cfg.get("interpolation", {})
     paths_cfg = cfg.get("paths", {})
 
@@ -645,27 +645,30 @@ def build_interpolator_from_config(
     clip_min = interp_cfg.get("clip_min", -1.0)
     clip_max = interp_cfg.get("clip_max", 1.0)
     scaler_path = paths_cfg.get("scaler_path", "DATA/train_multi_output_clear_sky/scaler.json")
+    weather = WeatherPreprocessor(**cfg.get("weather_preprocessing", {}))
 
     if strategy in ("mae", "mae_imputer", "masked_autoencoder"):
         ckpt = interp_cfg.get("mae_checkpoint", "checkpoints/mae_imputer_best.pt")
         return InterpolationFactory.create(
             strategy,
-            checkpoint_path=ckpt,
+            checkpoint_path=experiment_checkpoint_path(cfg, weather, ckpt),
             scaler_path=scaler_path,
             clip_min=clip_min,
             clip_max=clip_max,
             strict_checkpoint=strict_checkpoint,
+            expected_weather=weather,
         )
 
     if strategy in ("model", "bigru", "learned_imputer", "history_imputer"):
         ckpt = interp_cfg.get("model_checkpoint", "checkpoints/history_imputer_best.pt")
         return InterpolationFactory.create(
             strategy,
-            checkpoint_path=ckpt,
+            checkpoint_path=experiment_checkpoint_path(cfg, weather, ckpt),
             scaler_path=scaler_path,
             clip_min=clip_min,
             clip_max=clip_max,
             strict_checkpoint=strict_checkpoint,
+            expected_weather=weather,
         )
 
     if strategy in ("spline", "pchip", "cubic", "akima"):

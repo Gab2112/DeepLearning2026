@@ -29,13 +29,20 @@ from src.models.bigru_imputer import (
     compute_masked_loss,
 )
 from src.data.climate import encode_climate
-from src.data.transforms import ArcsinhScaler
+from src.data.transforms import ArcsinhScaler, scaler_for_imputer
+from src.data.weather_preprocessor import (
+    WeatherPreprocessor,
+    checkpoint_weather_preprocessor,
+    model_weather_preprocessor,
+)
 from src.models.mae_imputer import MAEHistoryImputer
 
 
 def load_mae_imputer_checkpoint(
     checkpoint_path: Union[str, Path] = "checkpoints/mae_imputer_best.pt",
     device: Optional[str] = None,
+    *,
+    expected_weather: Optional[WeatherPreprocessor] = None,
 ) -> Tuple[MAEHistoryImputer, Dict]:
     """
     Loads a trained MAEHistoryImputer model and metadata from checkpoint.
@@ -46,10 +53,13 @@ def load_mae_imputer_checkpoint(
         raise FileNotFoundError(f"MAE checkpoint not found at: {ckpt_path.resolve()}")
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    m_cfg = ckpt.get("config", {}).get("mae_model", {})
+    config = ckpt.get("config", {})
+    m_cfg = config.get("mae_model", {})
+    input_dim = m_cfg.get("input_dim", 27)
+    weather = checkpoint_weather_preprocessor(config, input_dim, expected_weather)
 
     model = MAEHistoryImputer(
-        input_dim=m_cfg.get("input_dim", 27),
+        input_dim=input_dim,
         climate_dim=m_cfg.get("climate_dim", 8),
         d_model=m_cfg.get("d_model", 64),
         nhead=m_cfg.get("nhead", 4),
@@ -61,6 +71,9 @@ def load_mae_imputer_checkpoint(
     ).to(device)
 
     model.load_state_dict(ckpt["model_state_dict"])
+    model.weather_preprocessor = weather
+    if "scaler" in ckpt:
+        model.arcsinh_scaler = ArcsinhScaler(ckpt["scaler"])
     model.eval()
     return model, ckpt
 
@@ -83,10 +96,11 @@ def impute_sequence_mae(
 
     if model is None:
         model, _ = load_mae_imputer_checkpoint(device=device)
-    if scaler is None:
-        scaler = ArcsinhScaler(_resolve_project_path("DATA/train_multi_output_clear_sky/scaler.json"))
+    scaler = scaler_for_imputer(model, scaler)
 
-    features = build_imputer_features(h_raw, m_raw, scaler)
+    features = build_imputer_features(
+        h_raw, m_raw, scaler, weather_preprocessor=model_weather_preprocessor(model)
+    )
     climate_id = encode_climate(climate_str)
 
     x_tensor = torch.from_numpy(features).float().unsqueeze(0).to(device)
@@ -114,7 +128,7 @@ def impute_batch_sequences_mae(
     masks: List[np.ndarray],
     climates: List[str],
     model: MAEHistoryImputer,
-    scaler: ArcsinhScaler,
+    scaler: Optional[ArcsinhScaler] = None,
     device: Optional[str] = None,
     batch_size: int = 128,
     clip_min: Optional[float] = -1.0,
@@ -125,7 +139,9 @@ def impute_batch_sequences_mae(
     Modifies only missing target entries (columns 18..20) and leaves weather (0..17) untouched.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    scaler = scaler_for_imputer(model, scaler)
     model.eval()
+    weather = model_weather_preprocessor(model)
 
     num_samples = len(histories)
     results: List[np.ndarray] = [None] * num_samples
@@ -136,12 +152,12 @@ def impute_batch_sequences_mae(
         batch_m = masks[start_idx:end_idx]
         batch_c = climates[start_idx:end_idx]
 
-        feats = [build_imputer_features(h, m, scaler) for h, m in zip(batch_h, batch_m)]
+        feats = [build_imputer_features(h, m, scaler, weather_preprocessor=weather) for h, m in zip(batch_h, batch_m)]
         lengths = [f.shape[0] for f in feats]
         max_l = max(lengths)
         B = len(feats)
 
-        x_padded = torch.zeros(B, max_l, 27, dtype=torch.float32)
+        x_padded = torch.zeros(B, max_l, feats[0].shape[-1], dtype=torch.float32)
         pad_mask = torch.zeros(B, max_l, dtype=torch.bool)
         c_ids = torch.zeros(B, dtype=torch.long)
 
@@ -196,12 +212,16 @@ def evaluate_mae_imputer_on_sample(
     preds_all: Dict[str, List[float]] = {n: [] for n in target_names}
     trues_all: Dict[str, List[float]] = {n: [] for n in target_names}
 
+    scaler = scaler_for_imputer(model, scaler)
     model.eval()
+    weather = model_weather_preprocessor(model)
     for drop_idx in valid_indices:
         perturbed_mask = obs_mask.copy()
         perturbed_mask[drop_idx] = False
 
-        feats = build_imputer_features(h_raw, m_raw, scaler, obs_mask_override=perturbed_mask)
+        feats = build_imputer_features(
+            h_raw, m_raw, scaler, obs_mask_override=perturbed_mask, weather_preprocessor=weather
+        )
         x_t = torch.from_numpy(feats).float().unsqueeze(0).to(device)
         c_t = torch.tensor([encode_climate(climate_str)], dtype=torch.long, device=device)
 

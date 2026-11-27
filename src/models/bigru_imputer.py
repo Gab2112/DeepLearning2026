@@ -8,7 +8,7 @@ evaluate, and perform inference/imputation on satellite time-series data.
 Features:
 1. Neural Model Architecture (BiGRUHistoryImputer with Climate Embedding).
 2. Orbital Mechanics Calculations (5-day Sentinel-2 cadence, phase, revisit gaps).
-3. Feature Engineering & Preprocessing (Arcsinh transform, 27-dim vector).
+3. Feature Engineering & Preprocessing (27 legacy channels or 35 with weather masks).
 4. Safe Model Loading & Checkpoint Management.
 5. Sequence & Batch Imputation (replaces NaNs with continuous physical predictions).
 6. File-level Imputation (processes full .npz datasets).
@@ -40,6 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from src.data.transforms import ArcsinhScaler
+    from src.data.weather_preprocessor import WeatherPreprocessor
 
 from src.models.history_imputer import BiGRUHistoryImputer
 
@@ -88,16 +89,16 @@ def build_imputer_features(
     m_raw: np.ndarray,
     scaler: ArcsinhScaler,
     obs_mask_override: Optional[np.ndarray] = None,
+    *,
+    weather_preprocessor: Optional[WeatherPreprocessor] = None,
 ) -> np.ndarray:
-    """
-    Builds the standardized 27-dimensional feature matrix for a history sequence:
-        [18 weather/calendar, 3 normalized targets, 3 mask flags, 3 orbital dynamics].
-    """
+    """Build historical imputer features in the same order as the training dataset."""
+    from src.data.weather_preprocessor import WeatherPreprocessor
+
     L = h_raw.shape[0]
 
-    # 1. Weather + Calendar DOY features (0..17)
-    norm_weather = scaler.transform_features(h_raw)[:, :18]
-    norm_weather = np.nan_to_num(norm_weather, nan=0.0)
+    preprocessor = weather_preprocessor or WeatherPreprocessor()
+    weather = preprocessor.transform(h_raw, m_raw, scaler)
 
     # 2. Observed targets (18..20)
     targets_raw = h_raw[:, 18:21]
@@ -121,8 +122,10 @@ def build_imputer_features(
     orbital_feats = np.stack([delta_t, phase, missed], axis=-1)
 
     # Concatenate full vector
-    features = np.concatenate([norm_weather, input_targets, mask_feat, orbital_feats], axis=-1)
-    return np.nan_to_num(features, nan=0.0)
+    parts = [weather.values, input_targets, mask_feat, orbital_feats]
+    if preprocessor.uses_masks:
+        parts.append(weather.weather_mask)
+    return np.nan_to_num(np.concatenate(parts, axis=-1), nan=0.0)
 
 
 # =====================================================================
@@ -137,6 +140,8 @@ def _resolve_project_path(path: Union[str, Path]) -> Path:
 def load_imputer_checkpoint(
     checkpoint_path: Union[str, Path] = "checkpoints/history_imputer_best.pt",
     device: Optional[str] = None,
+    *,
+    expected_weather: Optional[WeatherPreprocessor] = None,
 ) -> Tuple[BiGRUHistoryImputer, Dict]:
     """
     Loads trained BiGRUHistoryImputer model and metadata from checkpoint.
@@ -146,18 +151,17 @@ def load_imputer_checkpoint(
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path.resolve()}")
 
+    from src.data.weather_preprocessor import checkpoint_weather_preprocessor
+    from src.data.transforms import ArcsinhScaler
+
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    m_cfg = ckpt.get("config", {}).get("imputer_model", {
-        "input_dim": 27,
-        "climate_dim": 8,
-        "hidden_dim": 64,
-        "num_layers": 2,
-        "output_dim": 3,
-        "dropout": 0.1,
-    })
+    config = ckpt.get("config", {})
+    m_cfg = config.get("imputer_model", {})
+    input_dim = m_cfg.get("input_dim", 27)
+    weather = checkpoint_weather_preprocessor(config, input_dim, expected_weather)
 
     model = BiGRUHistoryImputer(
-        input_dim=m_cfg.get("input_dim", 27),
+        input_dim=input_dim,
         climate_dim=m_cfg.get("climate_dim", 8),
         hidden_dim=m_cfg.get("hidden_dim", 64),
         num_layers=m_cfg.get("num_layers", 2),
@@ -166,6 +170,9 @@ def load_imputer_checkpoint(
     ).to(device)
 
     model.load_state_dict(ckpt["model_state_dict"])
+    model.weather_preprocessor = weather
+    if "scaler" in ckpt:
+        model.arcsinh_scaler = ArcsinhScaler(ckpt["scaler"])
     model.eval()
     return model, ckpt
 
@@ -191,13 +198,17 @@ def impute_sequence(
     if model is None:
         model, _ = load_imputer_checkpoint(device=device)
 
-    if scaler is None:
-        from src.data.transforms import ArcsinhScaler
-        scaler = ArcsinhScaler(_resolve_project_path("DATA/train_multi_output_clear_sky/scaler.json"))
+    from src.data.transforms import scaler_for_imputer
+
+    scaler = scaler_for_imputer(model, scaler)
 
     # Build features
     from src.data.climate import encode_climate
-    features = build_imputer_features(h_raw, m_raw, scaler)
+    from src.data.weather_preprocessor import model_weather_preprocessor
+
+    features = build_imputer_features(
+        h_raw, m_raw, scaler, weather_preprocessor=model_weather_preprocessor(model)
+    )
     climate_id = encode_climate(climate_str)
 
     x_tensor = torch.from_numpy(features).float().unsqueeze(0).to(device)
@@ -225,7 +236,7 @@ def impute_batch_sequences(
     masks: List[np.ndarray],
     climates: List[str],
     model: BiGRUHistoryImputer,
-    scaler: ArcsinhScaler,
+    scaler: Optional[ArcsinhScaler] = None,
     device: Optional[str] = None,
     batch_size: int = 64,
     clip_min: Optional[float] = -1.0,
@@ -235,8 +246,13 @@ def impute_batch_sequences(
     Batched imputation for a list of history sequences (L_i, 21).
     Only modifies missing target columns (18..20) and leaves weather columns (0..17) untouched.
     """
+    from src.data.weather_preprocessor import model_weather_preprocessor
+    from src.data.transforms import scaler_for_imputer
+
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    scaler = scaler_for_imputer(model, scaler)
     model.eval()
+    weather = model_weather_preprocessor(model)
 
     num_samples = len(histories)
     results: List[np.ndarray] = [None] * num_samples
@@ -247,12 +263,12 @@ def impute_batch_sequences(
         batch_m = masks[start_idx:end_idx]
         batch_c = climates[start_idx:end_idx]
 
-        feats = [build_imputer_features(h, m, scaler) for h, m in zip(batch_h, batch_m)]
+        feats = [build_imputer_features(h, m, scaler, weather_preprocessor=weather) for h, m in zip(batch_h, batch_m)]
         lengths = [f.shape[0] for f in feats]
         max_l = max(lengths)
         B = len(feats)
 
-        x_padded = torch.zeros(B, max_l, 27, dtype=torch.float32)
+        x_padded = torch.zeros(B, max_l, feats[0].shape[-1], dtype=torch.float32)
         pad_mask = torch.zeros(B, max_l, dtype=torch.bool)
         c_ids = torch.zeros(B, dtype=torch.long)
 
@@ -360,11 +376,18 @@ def evaluate_imputer_on_sample(
     target_names = ["NDVI", "GNDVI", "EVI"]
 
     from src.data.climate import encode_climate
+    from src.data.transforms import scaler_for_imputer
+    from src.data.weather_preprocessor import model_weather_preprocessor
+
+    scaler = scaler_for_imputer(model, scaler)
+    weather = model_weather_preprocessor(model)
     for drop_idx in valid_indices:
         perturbed_mask = obs_mask.copy()
         perturbed_mask[drop_idx] = False
 
-        feats = build_imputer_features(h_raw, m_raw, scaler, obs_mask_override=perturbed_mask)
+        feats = build_imputer_features(
+            h_raw, m_raw, scaler, obs_mask_override=perturbed_mask, weather_preprocessor=weather
+        )
         x_t = torch.from_numpy(feats).float().unsqueeze(0).to(device)
         c_t = torch.tensor([encode_climate(climate_str)], dtype=torch.long, device=device)
 
@@ -444,8 +467,7 @@ def main():
                         help="Execution mode: test (impute 1 sample), evaluate (leave-one-out metrics), or train")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/history_imputer_best.pt",
                         help="Path to trained imputer checkpoint")
-    parser.add_argument("--scaler", type=str, default="DATA/train_multi_output_clear_sky/scaler.json",
-                        help="Path to scaler.json")
+    parser.add_argument("--scaler", type=str, default=None, help="Scaler path for legacy checkpoints")
     parser.add_argument("--config", type=str, default="configs/config.yaml",
                         help="Path to config.yaml")
     args = parser.parse_args()
@@ -457,9 +479,9 @@ def main():
         return
 
     # For test and evaluate, load sample data
-    from src.data.transforms import ArcsinhScaler
-    scaler = ArcsinhScaler(args.scaler)
+    from src.data.transforms import ArcsinhScaler, scaler_for_imputer
     model, _ = load_imputer_checkpoint(args.checkpoint, device=device)
+    scaler = scaler_for_imputer(model, ArcsinhScaler(args.scaler) if args.scaler else None)
 
     data_files = sorted(list(Path("DATA/train_multi_output_clear_sky").glob("*.npz")))
     if not data_files:

@@ -12,6 +12,9 @@ paths:
   checkpoints_dir: "checkpoints"
   results_dir: "results"
 
+scaling:
+  mode: "fitting_tiles"  # "distributed" is available for legacy checkpoints
+
 data:
   seed: 42
   # Partizionamento per Tile nello split di train (per evitare data leakage)
@@ -28,18 +31,26 @@ interpolation:
   # 'spline' (pchip/cubic), 'mean', 'median', 'constant', 'model' (bigru), 'mae', 'none'
   strategy: "linear"
   target_columns: [18, 19, 20]     # Colonne target storiche da interpolare (NDVI, GNDVI, EVI)
-  interpolate_weather: true         # Interpola anche eventuali rari buchi nel meteo (0..17)
+  interpolate_weather: true         # Interpolazione covariate storiche nel forecaster per M0
   clip_min: -1.0                    # Limite inferiore per indici di vegetazione
   clip_max: 1.0                     # Limite superiore per indici di vegetazione
   spline_kind: "pchip"              # 'pchip' preserva la forma fisica senza overshooting
   model_checkpoint: "checkpoints/history_imputer_best.pt"
   mae_checkpoint: "checkpoints/mae_imputer_best.pt"
 
+# M0: pipeline originale. M1: zero filling + maschere.
+# M2: M1 + cleaning storico. M3: M2 + clipping meteo futuro.
+# M4: interpolazione storica di M0 + maschere originali, futuro di M1.
+weather_preprocessing:
+  profile: "M0"
+  temperature_tolerance_c: 1.0     # Soglia sperimentale per le inversioni termiche
+  temperature_policy: "mask_triplet"  # Oppure "ignore" per disabilitare il controllo della terna
+
 # ---------------------------------------------------------------------
 # Modello di Imputazione del Passato (Bi-GRU Imputer)
 # ---------------------------------------------------------------------
 imputer_model:
-  input_dim: 27           # 18 meteo/DOY + 3 target sparsi + 3 maschere + 3 orbita/tempo
+  input_dim: 27           # M0. La configurazione effettiva usa 35 canali con M1–M4
   climate_dim: 8          # Dimensione dell'embedding per le classi climatiche di Köppen
   hidden_dim: 64
   num_layers: 2
@@ -58,7 +69,7 @@ imputer_training:
 # Modello di Imputazione Masked Autoencoder (MAE Transformer Imputer)
 # ---------------------------------------------------------------------
 mae_model:
-  input_dim: 27
+  input_dim: 27           # M0. La configurazione effettiva usa 35 canali con M1–M4
   climate_dim: 8
   d_model: 64
   nhead: 4

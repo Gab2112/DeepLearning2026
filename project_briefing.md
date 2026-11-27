@@ -1,9 +1,17 @@
 # Briefing di progetto — *Forecasting vegetation health from satellite time series*
 
-**Fonte:** [DL_Project.pdf](file:///c:/Users/Daniele/Desktop/Progetto%20Deep%20Learning/DeepLearning2026/DL_Project.pdf) (7 slide).
+**Fonte:** [DL_Project.pdf](DL_Project.pdf) (7 slide).
 
 > [!NOTE]
-> Il briefing si basa **solo sul PDF**. In alcuni punti il [README dei dati](file:///c:/Users/Daniele/Desktop/Progetto%20Deep%20Learning/DeepLearning2026/DATA/README.md) dà dettagli in più. Quando li uso, li segno con 📎 **README** per non confonderli con il contenuto delle slide.
+> Il briefing si basa **solo sul PDF**. In alcuni punti il [README dei dati](DATA/README.md) dà dettagli in più. Quando li uso, li segno con 📎 **README** per non confonderli con il contenuto delle slide.
+
+### Stato dell'implementazione
+
+La slide 5 consente la normalizzazione con uno scaler proprio. Il protocollo implementato stima lo scaler Arcsinh sui 70 tile di fitting e lo riusa sui 14 tile di validation, con split stratificato per clima e seed 42. I checkpoint registrano le statistiche effettive. Gli split ID, OOD-S e OOD-T sono riservati alla valutazione finale.
+
+La configurazione corrente comprende M0–M4. M4 conserva l'interpolazione meteo storica e aggiunge flag basati sulla disponibilità precedente all'interpolazione. Il clipping delle frazioni nuvolose è sospeso in attesa della documentazione della scala delle colonne aggregate. Le verifiche sul train hanno individuato 852 misure finite e originariamente disponibili invalidate dal controllo termico. [Profili nel README](README.md#profili-meteorologici) · [Audit del train](results/weather_qc_train.csv)
+
+Le ipotesi di ablazione confrontano i profili meteo con imputatore fisso, poi gli imputatori con meteo fisso. L'interpolazione lineare è il default. Bi-GRU, MAE e gli altri candidati restano da confrontare sul forecasting con pinball loss, MAE della mediana e calibrazione. I test e gli smoke test verificano l'esecuzione. Le misure del benchmark definitivo richiedono checkpoint addestrati e il confronto sul forecasting richiede il forecaster. [Comandi e limiti](README.md#uso-e-verifica)
 
 ---
 
@@ -133,7 +141,7 @@ Il confronto è con un **modello di riferimento dei docenti**. Si usano gli stes
 |---|---|---|---|---|
 | **0** | **Setup** | Creare repo e ambiente Python. Fissare il seed. Creare la struttura `src/`, `notebooks/`, `configs/`. Scrivere subito `requirements.txt` con versioni fissate | Il codice deve essere eseguibile da capo a fondo e riproducibile (slide 7) | Repo con scheletro, ambiente funzionante |
 | **1** | **Caricamento e verifica dei dati** | Scrivere un loader per tutti gli split. Controllare che le dimensioni siano (finestre × passi × 21 feature) e (finestre × 3 × 3 target). Controllare che il numero di campioni coincida con le slide (55,338 / 3,336 / 25,619 / 6,512) | Capire con esattezza il formato e scoprire subito eventuali incongruenze | Modulo `data.py` e report di verifica |
-| **2** | **Analisi esplorativa (EDA)** | Distribuzioni di feature e target. Percentuale di NaN e struttura delle maschere. Intervalli irregolari tra le date. Stagionalità degli indici. Differenze tra split e tra climi di Köppen. Correlazioni meteo–indici | Guida il preprocessing. Misura lo shift tra train, ood-s e ood-t, che è il criterio principale | Notebook EDA con grafici e insight per la presentazione |
+| **2** | **Analisi esplorativa (EDA)** | Sul solo train, analizzare distribuzioni, NaN, maschere, intervalli tra date, stagionalità, differenze tra climi di Köppen e correlazioni meteo–indici | Guida il preprocessing. Gli split ID, OOD-S e OOD-T sono riservati alla valutazione finale | Notebook EDA con grafici e insight per la presentazione |
 | **3** | **Protocollo di validazione** | Ricavare dal train una validazione **disgiunta per area** (raggruppando per tile) e, se possibile, **per anno** (ad esempio validare sul 2019) | La slide 4 impone di scegliere gli iperparametri sul train. Una validazione per gruppi imita ood-s e ood-t ed evita che informazioni da finestre sovrapposte (stride 4) passino dal train alla validazione | Indici di split fissati e salvati |
 | **4** | **Preprocessing** | Normalizzare con lo scaler del train (o uno proprio), **calcolato solo sul train**. Gestire i NaN con valori di riempimento + **maschera come feature di input**. Calcolare le inverse per tornare alla scala originale | I dati arrivano grezzi, con NaN e senza normalizzazione (slide 5). Le metriche si calcolano sulla scala originale (slide 6) | Pipeline `preprocess.py`, testata con un controllo andata-e-ritorno |
 | **5** | **Baseline** | (a) Persistenza, cioè ripetere l'ultimo valore osservato. (b) Climatologia per giorno dell'anno. (c) Modello statistico o ad albero con regressione quantile | Dà una base per confrontare i risultati e un riferimento per il MASE | Tabella di metriche delle baseline su id, ood-s, ood-t |
