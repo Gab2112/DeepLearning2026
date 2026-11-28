@@ -9,10 +9,11 @@ Executes:
 5. Checkpointing and evaluation on original scale.
 """
 
+import argparse
 import sys
 from pathlib import Path
 import time
-from typing import Optional, Union, Tuple
+from typing import Optional, Union
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -20,7 +21,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 
@@ -29,13 +29,19 @@ from src.data.transforms import ArcsinhScaler
 from src.data.splits import get_train_val_tile_split
 from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
 from src.data.bigru_imputer import compute_masked_loss
+from src.models.frozen import extract_arch, file_sha256, load_frozen_model, save_frozen_checkpoint
 from src.models.history_imputer import BiGRUHistoryImputer
 
 
 def train_imputer(
     config_path: Union[str, Path] = "configs/config.yaml",
+    epochs: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    max_train_tiles: Optional[int] = None,
+    max_val_tiles: Optional[int] = None,
+    save_path: Optional[Union[str, Path]] = None,
     device: Optional[str] = None,
-):
+) -> Path:
     # 1. Caricamento configurazione centralizzata da YAML
     cfg = load_config(config_path)
 
@@ -43,21 +49,33 @@ def train_imputer(
     data_cfg = cfg["data"]
     m_cfg = cfg["imputer_model"]
     t_cfg = cfg["imputer_training"]
+    interp_cfg = cfg.get("interpolation", {})
 
     data_dir = paths_cfg["train_data_dir"]
     scaler_path = paths_cfg["scaler_path"]
-    save_path = paths_cfg["checkpoints_dir"] / t_cfg["checkpoint_name"]
+    target_save_path = (
+        Path(save_path)
+        if save_path is not None
+        else Path(paths_cfg["checkpoints_dir"]) / t_cfg["checkpoint_name"]
+    )
 
     num_train_tiles = data_cfg["num_train_tiles"]
     num_val_tiles = data_cfg["num_val_tiles"]
     climate_dropout_p = data_cfg["climate_dropout_p"]
-    seed = data_cfg["seed"]
+    seed = int(data_cfg["seed"])
 
-    epochs = t_cfg["epochs"]
-    batch_size = t_cfg["batch_size"]
-    lr = t_cfg["learning_rate"]
-    weight_decay = t_cfg["weight_decay"]
-    smoothness_weight = t_cfg["smoothness_weight"]
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    epochs_val = epochs if epochs is not None else int(t_cfg["epochs"])
+    batch_size_val = batch_size if batch_size is not None else int(t_cfg["batch_size"])
+    lr = float(t_cfg["learning_rate"])
+    weight_decay = float(t_cfg["weight_decay"])
+    smoothness_weight = float(t_cfg["smoothness_weight"])
+    clip_min = interp_cfg.get("clip_min", -1.0)
+    clip_max = interp_cfg.get("clip_max", 1.0)
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -69,7 +87,7 @@ def train_imputer(
     print(f"[*] Project Root     : {cfg['project_root']}")
     print(f"[*] Device           : {device}")
     print(f"[*] Data Directory   : {data_dir}")
-    print(f"[*] Checkpoint Target: {save_path}")
+    print(f"[*] Checkpoint Target: {target_save_path}")
 
     # 2. Tile Partitioning (Split geografico disgiunto e stratificato per clima)
     all_files = sorted(list(data_dir.glob("*.npz")))
@@ -88,12 +106,21 @@ def train_imputer(
     )
     if num_train_tiles < len(train_files):
         train_files = train_files[:num_train_tiles]
+    if max_train_tiles is not None:
+        train_files = train_files[:max_train_tiles]
+    if max_val_tiles is not None:
+        val_files = val_files[:max_val_tiles]
+
+    assert set(train_files).isdisjoint(set(val_files)), "Data leakage: train_files and val_files overlap!"
+
     print(f"[*] Train Tiles: {len(train_files)} | Val Tiles: {len(val_files)} (su {len(all_files)} totali)")
-    print(f"[*] Climi Train: {split_summary['train']}")
-    print(f"[*] Climi Val  : {split_summary['val']}")
+    if max_train_tiles is None and max_val_tiles is None:
+        print(f"[*] Climi Train: {split_summary['train']}")
+        print(f"[*] Climi Val  : {split_summary['val']}")
 
     # 3. Scaler
     scaler = ArcsinhScaler(scaler_path)
+    scaler_sha = file_sha256(scaler_path)
     print(f"[*] Scaler caricato da: {scaler_path}")
 
     # 4. Datasets & Loaders
@@ -113,33 +140,29 @@ def train_imputer(
         mask_dropout=True,
         climate_dropout_p=0.0,
         seed=seed + 1,
+        loo_all_points=True,
     )
-    print(f"[*] Campioni Train: {len(train_ds):,} | Campioni Val: {len(val_ds):,}")
+    print(f"[*] Campioni Train: {len(train_ds):,} | Val LOO Targets: {len(val_ds):,}")
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_history_batch)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_history_batch)
+    train_loader = DataLoader(train_ds, batch_size=batch_size_val, shuffle=True, collate_fn=collate_history_batch)
+    val_loader = DataLoader(val_ds, batch_size=max(batch_size_val, 256), shuffle=False, collate_fn=collate_history_batch)
 
     # 5. Modello & Optimizer
-    model = BiGRUHistoryImputer(
-        input_dim=m_cfg["input_dim"],
-        climate_dim=m_cfg["climate_dim"],
-        hidden_dim=m_cfg["hidden_dim"],
-        num_layers=m_cfg["num_layers"],
-        output_dim=m_cfg["output_dim"],
-        dropout=m_cfg["dropout"],
-    ).to(device)
+    arch = extract_arch("bigru", m_cfg)
+    model = BiGRUHistoryImputer(**arch).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=1)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
 
-    best_val_loss = float("inf")
-    save_path.parent.mkdir(parents=True, exist_ok=True)
+    best_val_mae = float("inf")
+    target_save_path.parent.mkdir(parents=True, exist_ok=True)
+    target_names = ("NDVI", "GNDVI", "EVI")
 
     print("\n" + "-" * 65)
     print(" INIZIO CICLO DI ADDESTRAMENTO")
     print("-" * 65)
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(1, epochs_val + 1):
         t0 = time.time()
         model.train()
         total_train_loss = 0.0
@@ -170,15 +193,13 @@ def train_imputer(
         avg_train_loss = total_train_loss / max(1, batches)
         avg_train_recon = total_train_recon / max(1, batches)
 
-        # Validazione onesta su punti clear-sky mascherati
+        # Validazione deterministica LOO su tutti i punti clear-sky
         model.eval()
         total_val_loss = 0.0
         val_batches = 0
         abs_err_sum = np.zeros(3, dtype=np.float64)
         count_masked = 0
-        target_names = ("NDVI", "GNDVI", "EVI")
 
-        val_ds.rng = np.random.RandomState(seed + 1)
         with torch.no_grad():
             for batch in val_loader:
                 x = batch["input"].to(device)
@@ -198,6 +219,8 @@ def train_imputer(
                     p_masked = preds[loss_mask]
                     t_masked = target[loss_mask]
                     p_orig = scaler.torch_inverse_transform_targets(p_masked)
+                    if clip_min is not None or clip_max is not None:
+                        p_orig = torch.clamp(p_orig, min=clip_min, max=clip_max)
                     t_orig = scaler.torch_inverse_transform_targets(t_masked)
                     abs_err_sum += torch.abs(p_orig - t_orig).sum(dim=0).cpu().numpy()
                     count_masked += int(loss_mask.sum().item())
@@ -210,37 +233,43 @@ def train_imputer(
         avg_val_mae = float(np.mean(list(per_idx_mae.values())))
         elapsed = time.time() - t0
 
-        scheduler.step(avg_val_loss)
+        scheduler.step(avg_val_mae)
 
-        is_best = avg_val_loss < best_val_loss
+        is_best = avg_val_mae < best_val_mae
         if is_best:
-            best_val_loss = avg_val_loss
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "config": cfg,
-                "val_loss": best_val_loss,
-                "val_mae_orig": avg_val_mae,
-                "val_mae_per_index": per_idx_mae,
-            }, save_path)
+            best_val_mae = avg_val_mae
+            save_frozen_checkpoint(
+                target_save_path,
+                model=model,
+                model_type="bigru",
+                arch=arch,
+                metadata={
+                    "epoch": epoch,
+                    "val_loss": float(avg_val_loss),
+                    "val_mae_orig": float(avg_val_mae),
+                    "val_mae_per_index": per_idx_mae,
+                    "seed": seed,
+                    "scaler_sha256": scaler_sha,
+                    "train_tiles": [p.name for p in train_files],
+                    "val_tiles": [p.name for p in val_files],
+                },
+                full_config=cfg,
+            )
 
         flag = " [BEST SAVED]" if is_best else ""
         idx_str = " ".join(f"{n}={per_idx_mae[n]:.4f}" for n in target_names)
-        print(f"Epoch {epoch:02d}/{epochs:02d} [{elapsed:4.1f}s] | "
+        print(f"Epoch {epoch:02d}/{epochs_val:02d} [{elapsed:4.1f}s] | "
               f"Train Loss: {avg_train_loss:.4f} (Recon: {avg_train_recon:.4f}) | "
               f"Val Loss: {avg_val_loss:.4f} | Val MAE: {avg_val_mae:.4f} [{idx_str}]{flag}")
 
     print("-" * 65)
-    print(f"[*] Training completato! Miglior checkpoint salvato in:\n    {save_path}")
+    print(f"[*] Training completato! Miglior checkpoint frozen salvato in:\n    {target_save_path}")
 
-    if save_path.exists():
-        best_ckpt = torch.load(save_path, map_location=device, weights_only=False)
-        model.load_state_dict(best_ckpt["model_state_dict"])
+    if target_save_path.exists():
+        model, _ = load_frozen_model(target_save_path, device=device, verify=True)
 
-    val_ds.rng = np.random.RandomState(seed + 1)
-    # Dimostrazione pratica su un campione di validazione
     demonstrate_imputation(model, val_ds, scaler, device)
+    return target_save_path
 
 
 def demonstrate_imputation(model, dataset, scaler, device):
@@ -275,5 +304,27 @@ def demonstrate_imputation(model, dataset, scaler, device):
     print("-" * 84)
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Train Bi-GRU History Imputer")
+    parser.add_argument("--config", type=str, default="configs/config.yaml")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--max-train-tiles", type=int, default=None)
+    parser.add_argument("--max-val-tiles", type=int, default=None)
+    parser.add_argument("--save-path", type=str, default=None)
+    parser.add_argument("--device", type=str, default=None)
+    args = parser.parse_args()
+
+    train_imputer(
+        config_path=args.config,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        max_train_tiles=args.max_train_tiles,
+        max_val_tiles=args.max_val_tiles,
+        save_path=args.save_path,
+        device=args.device,
+    )
+
+
 if __name__ == "__main__":
-    train_imputer()
+    main()

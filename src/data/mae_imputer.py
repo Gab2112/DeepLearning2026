@@ -39,13 +39,20 @@ def load_mae_imputer_checkpoint(
 ) -> Tuple[MAEHistoryImputer, Dict]:
     """
     Loads a trained MAEHistoryImputer model and metadata from checkpoint.
+    Freezes parameters (eval mode + requires_grad=False).
     """
+    from src.models.frozen import freeze_model
+
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_path = _resolve_project_path(checkpoint_path)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"MAE checkpoint not found at: {ckpt_path.resolve()}")
 
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    try:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    except Exception:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
     m_cfg = ckpt.get("config", {}).get("mae_model", {})
 
     model = MAEHistoryImputer(
@@ -61,7 +68,7 @@ def load_mae_imputer_checkpoint(
     ).to(device)
 
     model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
+    freeze_model(model)
     return model, ckpt
 
 

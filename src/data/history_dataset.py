@@ -39,9 +39,19 @@ class HistoryImputationDataset(Dataset):
         interpolation_columns: Optional[Sequence[int]] = (18, 19, 20),
         interpolation_kwargs: Optional[Dict] = None,
         seed: int = 42,
+        loo_all_points: bool = False,
     ):
+        """
+        loo_all_points=True builds a deterministic leave-one-out evaluation set: every window
+        is repeated once per clear-sky observation, and in repetition r the r-th observation
+        is hidden. Requires mask_dropout=True. Windows with < 2 observations are skipped.
+        """
         super().__init__()
+        if loo_all_points and not mask_dropout:
+            raise ValueError("loo_all_points=True requires mask_dropout=True")
         self.scaler = scaler
+        self.loo_all_points = loo_all_points
+        self.drop_ranks: Optional[List[int]] = [] if loo_all_points else None
         self.mask_dropout = mask_dropout
         self.climate_dropout_p = climate_dropout_p
         self.interpolation_columns = interpolation_columns
@@ -73,14 +83,47 @@ class HistoryImputationDataset(Dataset):
             climates = d["climate"] if "climate" in d else np.array(["unknown"] * len(histories))
             num_samples = len(histories)
 
+            norm_weather_list = []
+            norm_targets_list = []
+            obs_mask_list = []
+            valid_indices_list = []
+            climate_ids_arr = np.empty(num_samples, dtype=np.int64)
+
+            for s_idx in range(num_samples):
+                h_s = histories[s_idx].astype(np.float32)
+                m_s = masks[s_idx]
+                nw = self.scaler.transform_features(h_s)[:, :18]
+                nw = np.nan_to_num(nw, nan=0.0).astype(np.float32, copy=False)
+                nt = self.scaler.transform_targets(h_s[:, 18:21]).astype(np.float32, copy=False)
+                om = (~m_s[:, 18]).astype(bool, copy=False)
+                vi = np.where(om)[0].astype(np.int64, copy=False)
+
+                norm_weather_list.append(nw)
+                norm_targets_list.append(nt)
+                obs_mask_list.append(om)
+                valid_indices_list.append(vi)
+                climate_ids_arr[s_idx] = encode_climate(str(climates[s_idx]))
+
             self.file_cache[fpath] = {
                 "history": histories,
                 "history_mask": masks,
                 "climate": climates,
+                "norm_weather": norm_weather_list,
+                "norm_targets": norm_targets_list,
+                "obs_mask": obs_mask_list,
+                "valid_indices": valid_indices_list,
+                "climate_ids": climate_ids_arr,
             }
 
             for s_idx in range(num_samples):
-                self.samples.append((fpath, s_idx))
+                if loo_all_points:
+                    n_valid = len(valid_indices_list[s_idx])
+                    if n_valid >= 2:
+                        for rank in range(n_valid):
+                            self.samples.append((fpath, s_idx))
+                            self.drop_ranks.append(rank)
+                else:
+                    self.samples.append((fpath, s_idx))
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -93,67 +136,46 @@ class HistoryImputationDataset(Dataset):
         3. missed_revisits: number of 5-day revisit opportunities missed due to clouds
         """
         L = len(obs_mask)
-        delta_t = np.zeros(L, dtype=np.float32)
-        orbital_phase = np.zeros(L, dtype=np.float32)
-        missed_revisits = np.zeros(L, dtype=np.float32)
-
-        last_obs = 0.0
-        has_seen_first = False
-
-        for t in range(L):
-            orbital_phase[t] = (t % 5) / 5.0
-
-            if obs_mask[t]:
-                delta_t[t] = 0.0
-                missed_revisits[t] = 0.0
-                last_obs = float(t)
-                has_seen_first = True
-            else:
-                if has_seen_first:
-                    elapsed = float(t) - last_obs
-                    delta_t[t] = elapsed
-                    # Each 5 days represents one missed satellite pass
-                    missed_revisits[t] = float(np.floor(elapsed / 5.0))
-                else:
-                    delta_t[t] = 0.0
-                    missed_revisits[t] = 0.0
-
+        idx = np.arange(L, dtype=np.float32)
+        orbital_phase = (idx % 5.0) / 5.0
+        obs_pos = np.where(obs_mask, idx, -1.0)
+        last_obs = np.maximum.accumulate(obs_pos)
+        has_seen = last_obs >= 0.0
+        delta_t = np.where(has_seen & (~obs_mask), idx - last_obs, 0.0).astype(np.float32)
+        missed_revisits = np.floor(delta_t / 5.0).astype(np.float32)
         return delta_t, orbital_phase, missed_revisits
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         fpath, s_idx = self.samples[idx]
         cached = self.file_cache[fpath]
-        h_raw = cached["history"][s_idx].astype(np.float32)  # shape (L, 21)
-        m_raw = cached["history_mask"][s_idx]               # shape (L, 21), True where missing
+
+        norm_weather_calendar = cached["norm_weather"][s_idx]
+        norm_targets = cached["norm_targets"][s_idx]
+        obs_mask = cached["obs_mask"][s_idx]
+        valid_indices = cached["valid_indices"][s_idx]
+        climate_id = int(cached["climate_ids"][s_idx])
         raw_climate = str(cached["climate"][s_idx])
 
-        L = h_raw.shape[0]
-
-        # 1. Feature normalization with ArcsinhScaler
-        norm_weather_calendar = self.scaler.transform_features(h_raw)[:, :18]
-        norm_weather_calendar = np.nan_to_num(norm_weather_calendar, nan=0.0)
-
-        # Targets 18..20 (NDVI, GNDVI, EVI)
-        targets_raw = h_raw[:, 18:21]
-        norm_targets = self.scaler.transform_targets(targets_raw)
-
-        # Boolean mask of valid observations
-        obs_mask = ~m_raw[:, 18]  # shape (L,), True where observed (the 3 clear-sky dates)
-        valid_indices = np.where(obs_mask)[0]
+        L = norm_weather_calendar.shape[0]
 
         # 2. Self-Supervised Mask Dropout (for training reconstruction)
         input_obs_mask = obs_mask.copy()
         eval_supervision_mask = np.zeros(L, dtype=bool)
+        drop_rank = -1
 
         if self.mask_dropout and len(valid_indices) >= 2:
-            drop_idx = self.rng.choice(valid_indices)
+            if self.drop_ranks is not None:
+                drop_rank = int(self.drop_ranks[idx])
+                drop_idx = valid_indices[drop_rank]
+            else:
+                drop_rank = int(self.rng.randint(len(valid_indices)))
+                drop_idx = valid_indices[drop_rank]
             input_obs_mask[drop_idx] = False
             eval_supervision_mask[drop_idx] = True
         else:
             eval_supervision_mask = obs_mask.copy()
 
         # 3. Climate tokenization & Climate Dropout (computed before optional interpolator)
-        climate_id = encode_climate(raw_climate)
         effective_climate_str = raw_climate
         if self.climate_dropout_p > 0.0 and self.rng.rand() < self.climate_dropout_p:
             climate_id = 0  # Force to <UNKNOWN> to train robustness for OOD-S
@@ -161,6 +183,8 @@ class HistoryImputationDataset(Dataset):
 
         # 4. Handle NaNs in input target / Apply Interpolation Strategy (never leak masked point)
         if self.interpolator is not None:
+            h_raw = cached["history"][s_idx].astype(np.float32)
+            m_raw = cached["history_mask"][s_idx]
             effective_mask = m_raw.copy()
             effective_mask[:, 18:21] = ~input_obs_mask[:, None]
             h_for_interp = h_raw.copy()
@@ -202,6 +226,7 @@ class HistoryImputationDataset(Dataset):
             "target": torch.from_numpy(clean_norm_targets).float(),
             "loss_mask": torch.from_numpy(eval_supervision_mask).bool(),
             "all_obs_mask": torch.from_numpy(obs_mask).bool(),
+            "drop_rank": torch.tensor(drop_rank, dtype=torch.long),
             "length": L,
         }
 
@@ -222,6 +247,7 @@ def collate_history_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, tor
     padded_obs_mask = torch.zeros(batch_size, max_len, dtype=torch.bool)
     padding_mask = torch.zeros(batch_size, max_len, dtype=torch.bool)
     climate_ids = torch.zeros(batch_size, dtype=torch.long)
+    drop_ranks = torch.full((batch_size,), -1, dtype=torch.long)
 
     for i, item in enumerate(batch):
         L = item["length"]
@@ -231,6 +257,8 @@ def collate_history_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, tor
         padded_obs_mask[i, :L] = item["all_obs_mask"]
         padding_mask[i, :L] = True
         climate_ids[i] = item["climate_id"]
+        if "drop_rank" in item:
+            drop_ranks[i] = item["drop_rank"]
 
     return {
         "input": padded_input,
@@ -239,5 +267,6 @@ def collate_history_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, tor
         "loss_mask": padded_loss_mask,
         "obs_mask": padded_obs_mask,
         "padding_mask": padding_mask,
+        "drop_ranks": drop_ranks,
         "lengths": torch.tensor(lengths, dtype=torch.long),
     }

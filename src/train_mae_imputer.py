@@ -30,6 +30,7 @@ from src.data.bigru_imputer import compute_masked_loss
 from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
 from src.data.splits import get_train_val_tile_split
 from src.data.transforms import ArcsinhScaler
+from src.models.frozen import extract_arch, file_sha256, load_frozen_model, save_frozen_checkpoint
 from src.models.mae_imputer import MAEHistoryImputer
 from src.utils.config import load_config
 
@@ -61,6 +62,7 @@ def train_mae_imputer(
     data_cfg = cfg["data"]
     m_cfg = cfg["mae_model"]
     t_cfg = cfg["mae_training"]
+    interp_cfg = cfg.get("interpolation", {})
 
     data_dir = paths_cfg["train_data_dir"]
     scaler_path = paths_cfg["scaler_path"]
@@ -73,10 +75,12 @@ def train_mae_imputer(
     num_train_tiles = data_cfg["num_train_tiles"]
     num_val_tiles = data_cfg["num_val_tiles"]
     climate_dropout_p = data_cfg["climate_dropout_p"]
-    seed = data_cfg["seed"]
+    seed = int(data_cfg["seed"])
 
     torch.manual_seed(seed)
     np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     epochs_val = epochs if epochs is not None else int(t_cfg["epochs"])
     batch_size_val = batch_size if batch_size is not None else int(t_cfg["batch_size"])
@@ -86,6 +90,8 @@ def train_mae_imputer(
     visible_recon_weight = float(t_cfg.get("visible_recon_weight", 0.25))
     weather_mask_ratio = float(t_cfg.get("weather_mask_ratio", 0.15))
     weather_recon_weight = float(t_cfg.get("weather_recon_weight", 0.1))
+    clip_min = interp_cfg.get("clip_min", -1.0)
+    clip_max = interp_cfg.get("clip_max", 1.0)
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -108,12 +114,15 @@ def train_mae_imputer(
     if max_val_tiles is not None:
         val_files = val_files[:max_val_tiles]
 
+    assert set(train_files).isdisjoint(set(val_files)), "Data leakage: train_files and val_files overlap!"
+
     print(f"[*] Train Tiles: {len(train_files)} | Val Tiles: {len(val_files)}")
     if max_train_tiles is None and max_val_tiles is None:
         print(f"[*] Climi Train: {split_summary['train']}")
         print(f"[*] Climi Val  : {split_summary['val']}")
 
     scaler = ArcsinhScaler(scaler_path)
+    scaler_sha = file_sha256(scaler_path)
 
     print("[*] Indexing datasets...")
     train_ds = HistoryImputationDataset(
@@ -124,8 +133,7 @@ def train_mae_imputer(
         climate_dropout_p=climate_dropout_p,
         seed=seed,
     )
-    # Honest validation: mask_dropout=True with deterministic seed so val measures
-    # true reconstruction error on unseen clear-sky observations.
+    # Deterministic Leave-One-Out validation across all 3 clear-sky observations per window.
     val_ds = HistoryImputationDataset(
         data_dir,
         scaler=scaler,
@@ -133,8 +141,9 @@ def train_mae_imputer(
         mask_dropout=True,
         climate_dropout_p=0.0,
         seed=seed + 1,
+        loo_all_points=True,
     )
-    print(f"[*] Train Windows: {len(train_ds):,} | Val Windows: {len(val_ds):,}")
+    print(f"[*] Train Windows: {len(train_ds):,} | Val LOO Targets: {len(val_ds):,}")
 
     train_loader = DataLoader(
         train_ds,
@@ -144,22 +153,13 @@ def train_mae_imputer(
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=batch_size_val,
+        batch_size=max(batch_size_val, 256),
         shuffle=False,
         collate_fn=collate_history_batch,
     )
 
-    model = MAEHistoryImputer(
-        input_dim=m_cfg["input_dim"],
-        climate_dim=m_cfg["climate_dim"],
-        d_model=m_cfg["d_model"],
-        nhead=m_cfg["nhead"],
-        num_encoder_layers=m_cfg["num_encoder_layers"],
-        num_decoder_layers=m_cfg["num_decoder_layers"],
-        dim_feedforward=m_cfg["dim_feedforward"],
-        output_dim=m_cfg["output_dim"],
-        dropout=m_cfg["dropout"],
-    ).to(device)
+    arch = extract_arch("mae", m_cfg)
+    model = MAEHistoryImputer(**arch).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[*] Model Parameters : {n_params:,}")
@@ -169,7 +169,7 @@ def train_mae_imputer(
         optimizer, mode="min", factor=0.5, patience=2
     )
 
-    best_val_loss = float("inf")
+    best_val_mae = float("inf")
     target_save_path.parent.mkdir(parents=True, exist_ok=True)
     target_names = ("NDVI", "GNDVI", "EVI")
 
@@ -245,15 +245,13 @@ def train_mae_imputer(
         avg_target_recon = total_target_recon / max(1, batches)
         avg_weather_recon = total_weather_recon / max(1, batches)
 
-        # Honest Validation on held-out tiles with masked clear-sky targets
+        # Honest Validation on held-out tiles with deterministic LOO clear-sky targets
         model.eval()
         total_val_loss = 0.0
         val_batches = 0
         abs_err_sum = np.zeros(3, dtype=np.float64)
         count_masked = 0
 
-        # Reset val dataset RNG for deterministic epoch-to-epoch validation comparison
-        val_ds.rng = np.random.RandomState(seed + 1)
         with torch.no_grad():
             for batch in val_loader:
                 x = batch["input"].to(device)
@@ -275,6 +273,8 @@ def train_mae_imputer(
 
                 if torch.any(loss_mask):
                     p_orig = scaler.torch_inverse_transform_targets(preds[loss_mask])
+                    if clip_min is not None or clip_max is not None:
+                        p_orig = torch.clamp(p_orig, min=clip_min, max=clip_max)
                     t_orig = scaler.torch_inverse_transform_targets(target[loss_mask])
                     abs_err = torch.abs(p_orig - t_orig).sum(dim=0).cpu().numpy()
                     abs_err_sum += abs_err
@@ -288,22 +288,27 @@ def train_mae_imputer(
         avg_val_mae = float(np.mean(list(per_idx_mae.values())))
         elapsed = time.time() - t0
 
-        scheduler.step(avg_val_loss)
+        scheduler.step(avg_val_mae)
 
-        is_best = avg_val_loss < best_val_loss
+        is_best = avg_val_mae < best_val_mae
         if is_best:
-            best_val_loss = avg_val_loss
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "config": cfg,
-                    "val_loss": best_val_loss,
-                    "val_mae_orig": avg_val_mae,
-                    "val_mae_per_index": per_idx_mae,
-                },
+            best_val_mae = avg_val_mae
+            save_frozen_checkpoint(
                 target_save_path,
+                model=model,
+                model_type="mae",
+                arch=arch,
+                metadata={
+                    "epoch": epoch,
+                    "val_loss": float(avg_val_loss),
+                    "val_mae_orig": float(avg_val_mae),
+                    "val_mae_per_index": per_idx_mae,
+                    "seed": seed,
+                    "scaler_sha256": scaler_sha,
+                    "train_tiles": [p.name for p in train_files],
+                    "val_tiles": [p.name for p in val_files],
+                },
+                full_config=cfg,
             )
 
         flag = " [BEST SAVED]" if is_best else ""
@@ -315,13 +320,11 @@ def train_mae_imputer(
         )
 
     print("-" * 72)
-    print(f"[*] Training completed! Best checkpoint saved to:\n    {target_save_path}")
+    print(f"[*] Training completed! Best frozen checkpoint saved to:\n    {target_save_path}")
 
     if target_save_path.exists():
-        best_ckpt = torch.load(target_save_path, map_location=device, weights_only=False)
-        model.load_state_dict(best_ckpt["model_state_dict"])
+        model, _ = load_frozen_model(target_save_path, device=device, verify=True)
 
-    val_ds.rng = np.random.RandomState(seed + 1)
     demonstrate_mae_imputation(model, val_ds, scaler, device)
     return target_save_path
 

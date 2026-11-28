@@ -409,13 +409,18 @@ class ModelInterpolator(BaseInterpolator):
             sys.modules["pathlib._local"] = pathlib
 
         from src.data.transforms import ArcsinhScaler
+        from src.models.frozen import freeze_model
         from src.models.history_imputer import BiGRUHistoryImputer
 
         if self.scaler_path.exists():
             self.scaler = ArcsinhScaler(self.scaler_path)
 
         if self.checkpoint_path.exists():
-            ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
+            try:
+                ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=True)
+            except Exception:
+                ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
+
             m_cfg = ckpt.get("config", {}).get("imputer_model", {
                 "input_dim": 27,
                 "climate_dim": 8,
@@ -434,7 +439,7 @@ class ModelInterpolator(BaseInterpolator):
             ).to(self.device)
 
             self.model.load_state_dict(ckpt["model_state_dict"])
-            self.model.eval()
+            freeze_model(self.model)
         elif self.strict_checkpoint:
             raise FileNotFoundError(f"Bi-GRU checkpoint not found at {self.checkpoint_path}")
         else:

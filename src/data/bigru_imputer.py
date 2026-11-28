@@ -52,30 +52,13 @@ def compute_orbital_dynamics(obs_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarr
     3. missed_revisits: number of 5-day revisit opportunities missed due to clouds.
     """
     L = len(obs_mask)
-    delta_t = np.zeros(L, dtype=np.float32)
-    orbital_phase = np.zeros(L, dtype=np.float32)
-    missed_revisits = np.zeros(L, dtype=np.float32)
-
-    last_obs = 0.0
-    has_seen_first = False
-
-    for t in range(L):
-        orbital_phase[t] = (t % 5) / 5.0
-
-        if obs_mask[t]:
-            delta_t[t] = 0.0
-            missed_revisits[t] = 0.0
-            last_obs = float(t)
-            has_seen_first = True
-        else:
-            if has_seen_first:
-                elapsed = float(t) - last_obs
-                delta_t[t] = elapsed
-                missed_revisits[t] = float(np.floor(elapsed / 5.0))
-            else:
-                delta_t[t] = 0.0
-                missed_revisits[t] = 0.0
-
+    idx = np.arange(L, dtype=np.float32)
+    orbital_phase = (idx % 5.0) / 5.0
+    obs_pos = np.where(obs_mask, idx, -1.0)
+    last_obs = np.maximum.accumulate(obs_pos)
+    has_seen = last_obs >= 0.0
+    delta_t = np.where(has_seen & (~obs_mask), idx - last_obs, 0.0).astype(np.float32)
+    missed_revisits = np.floor(delta_t / 5.0).astype(np.float32)
     return delta_t, orbital_phase, missed_revisits
 
 
@@ -136,13 +119,20 @@ def load_imputer_checkpoint(
 ) -> Tuple[BiGRUHistoryImputer, Dict]:
     """
     Loads trained BiGRUHistoryImputer model and metadata from checkpoint.
+    Freezes parameters (eval mode + requires_grad=False).
     """
+    from src.models.frozen import freeze_model
+
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_path = _resolve_project_path(checkpoint_path)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path.resolve()}")
 
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    try:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    except Exception:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
     m_cfg = ckpt.get("config", {}).get("imputer_model", {
         "input_dim": 27,
         "climate_dim": 8,
@@ -162,7 +152,7 @@ def load_imputer_checkpoint(
     ).to(device)
 
     model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
+    freeze_model(model)
     return model, ckpt
 
 

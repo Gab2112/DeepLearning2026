@@ -186,7 +186,7 @@ class MAEHistoryImputer(nn.Module):
             weather_mask: optional (B, L) boolean tensor (True where weather tokens are masked)
             return_weather: if True, returns (pred_targets, pred_weather)
         Returns:
-            pred_targets: (B, L, 3) or tuple ((B, L, 3), (B, L, 18))
+            pred_targets: (B, L, 3) or tuple ((B, L, 3), (B, L, 11))
         """
         B, L, _ = x.shape
 

@@ -91,7 +91,21 @@ class BiGRUHistoryImputer(nn.Module):
             x_combined = torch.cat([x, c_emb], dim=-1)
 
         h = self.input_proj(x_combined)  # (B, L, hidden_dim)
-        gru_out, _ = self.bigru(h)       # (B, L, 2 * hidden_dim)
+
+        if padding_mask is not None:
+            # Pack the sequences so that the backward GRU direction starts at each sequence's
+            # real last step instead of crossing the zero-padded tail. Without packing, the
+            # prediction for a window depends on the longest window in the same batch.
+            lengths = padding_mask.long().sum(dim=1).clamp(min=1).cpu()
+            packed = nn.utils.rnn.pack_padded_sequence(
+                h, lengths, batch_first=True, enforce_sorted=False
+            )
+            packed_out, _ = self.bigru(packed)
+            gru_out, _ = nn.utils.rnn.pad_packed_sequence(
+                packed_out, batch_first=True, total_length=L
+            )
+        else:
+            gru_out, _ = self.bigru(h)   # (B, L, 2 * hidden_dim)
         pred_targets = self.head(gru_out)  # (B, L, 3)
 
         if padding_mask is not None:

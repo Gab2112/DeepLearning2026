@@ -80,6 +80,22 @@ mae_training:
   checkpoint_name: "mae_imputer_best.pt"
 
 # ---------------------------------------------------------------------
+# Benchmark unificato di ricostruzione (Bi-GRU vs MAE vs baseline di interpolazione)
+# Selezione del modello SOLO sulle tile di validazione ricavate dal train.
+# id / ood-s / ood-t sono usati esclusivamente per il report finale.
+# ---------------------------------------------------------------------
+reconstruction_benchmark:
+  models: ["bigru", "mae"]
+  seeds: [42]
+  epochs: 20
+  early_stopping_patience: 6
+  eval_batch_size: 512
+  baselines: ["linear", "spline", "forward_fill", "backward_fill", "nearest", "mean", "median"]
+  output_dir: "results/reconstruction_benchmark"
+  frozen_dir: "checkpoints/reconstruction"
+  best_overall_checkpoint: "checkpoints/best_reconstruction_imputer.pt"
+
+# ---------------------------------------------------------------------
 # Modello di Forecasting Futuro (Predizione multi-step e probabilistica)
 # ---------------------------------------------------------------------
 forecasting:
