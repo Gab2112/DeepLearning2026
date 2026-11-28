@@ -7,7 +7,7 @@ from src.data.climate import encode_climate, CLIMATE_TO_ID, ID_TO_CLIMATE, NUM_C
 from src.data.splits import get_tile_dominant_climate, get_train_val_tile_split
 from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
 from src.data.vegetation_dataset import VegetationDataset, collate_vegetation_batch
-from src.data.bigru_imputer import (
+from src.models.bigru_imputer import (
     BiGRUHistoryImputer,
     compute_orbital_dynamics,
     build_imputer_features,

@@ -1,5 +1,5 @@
 """
-Training and Validation Pipeline for the Past Time-Series Imputer.
+Training and Validation Pipeline for the Bi-GRU Past Time-Series Imputer.
 Configured centrally via configs/config.yaml.
 Executes:
 1. Spatial Tile-based Train/Val splitting.
@@ -28,12 +28,12 @@ from src.utils.config import load_config
 from src.data.transforms import ArcsinhScaler
 from src.data.splits import get_train_val_tile_split
 from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
-from src.data.bigru_imputer import compute_masked_loss
+from src.models.bigru_imputer import compute_masked_loss
 from src.models.frozen import extract_arch, file_sha256, load_frozen_model, save_frozen_checkpoint
 from src.models.history_imputer import BiGRUHistoryImputer
 
 
-def train_imputer(
+def train_bigru_imputer(
     config_path: Union[str, Path] = "configs/config.yaml",
     epochs: Optional[int] = None,
     batch_size: Optional[int] = None,
@@ -304,6 +304,9 @@ def demonstrate_imputation(model, dataset, scaler, device):
     print("-" * 84)
 
 
+train_imputer = train_bigru_imputer
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train Bi-GRU History Imputer")
     parser.add_argument("--config", type=str, default="configs/config.yaml")
@@ -315,7 +318,7 @@ def main():
     parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
 
-    train_imputer(
+    train_bigru_imputer(
         config_path=args.config,
         epochs=args.epochs,
         batch_size=args.batch_size,

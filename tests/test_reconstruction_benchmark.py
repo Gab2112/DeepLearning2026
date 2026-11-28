@@ -15,7 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.bigru_imputer import compute_orbital_dynamics
+from src.models.bigru_imputer import compute_orbital_dynamics
 from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
 from src.data.interpolation import InterpolationFactory, MAEInterpolator, ModelInterpolator
 from src.data.transforms import ArcsinhScaler

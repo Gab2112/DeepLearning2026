@@ -34,7 +34,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.bigru_imputer import compute_masked_loss
+from src.models.bigru_imputer import compute_masked_loss
 from src.data.history_dataset import HistoryImputationDataset, collate_history_batch
 from src.data.interpolation import InterpolationFactory
 from src.data.splits import get_train_val_tile_split
@@ -800,7 +800,12 @@ def run_benchmark(
     best_by_type: Dict[str, Dict[str, Any]] = {}
 
     for mtype in model_list:
-        default_bs = int(cfg["imputer_training" if mtype == "bigru" else "mae_training"]["batch_size"])
+        default_bs = int(
+            bench_cfg.get(
+                "batch_size",
+                cfg["imputer_training" if mtype == "bigru" else "mae_training"]["batch_size"],
+            )
+        )
         bs_val = int(batch_size if batch_size is not None else default_bs)
         for seed in seed_list:
             run_ckpt = frz_dir / f"{mtype}_seed{seed}_frozen.pt"

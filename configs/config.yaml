@@ -47,8 +47,8 @@ imputer_model:
   dropout: 0.1
 
 imputer_training:
-  epochs: 10
-  batch_size: 128
+  epochs: 5
+  batch_size: 256
   learning_rate: 0.001
   weight_decay: 0.0001
   smoothness_weight: 0.05 # Peso della regolarizzazione temporale per evitare salti discontinui
@@ -69,8 +69,8 @@ mae_model:
   dropout: 0.1
 
 mae_training:
-  epochs: 15
-  batch_size: 128
+  epochs: 5
+  batch_size: 256
   learning_rate: 0.001
   weight_decay: 0.0001
   smoothness_weight: 0.05
@@ -88,6 +88,7 @@ reconstruction_benchmark:
   models: ["bigru", "mae"]
   seeds: [42]
   epochs: 20
+  batch_size: 128
   early_stopping_patience: 6
   eval_batch_size: 512
   baselines: ["linear", "spline", "forward_fill", "backward_fill", "nearest", "mean", "median"]

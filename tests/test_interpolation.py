@@ -31,7 +31,7 @@ from src.data.transforms import ArcsinhScaler
 from src.data.vegetation_dataset import VegetationDataset, collate_vegetation_batch
 from src.data.history_dataset import HistoryImputationDataset
 from src.data.splits import get_train_val_tile_split, get_tile_dominant_climate
-from src.data.bigru_imputer import BiGRUHistoryImputer as BigruModuleImputer
+from src.models.bigru_imputer import BiGRUHistoryImputer as BigruModuleImputer
 from src.models.history_imputer import BiGRUHistoryImputer as ModelsModuleImputer
 
 
@@ -413,7 +413,7 @@ def test_history_dataset_no_mask_dropout_leakage():
 
 def test_bigru_class_unification():
     assert BigruModuleImputer is ModelsModuleImputer, (
-        "BiGRUHistoryImputer should be defined once in src.models.history_imputer and imported in src.data.bigru_imputer."
+        "BiGRUHistoryImputer should be defined once in src.models.history_imputer and imported in src.models.bigru_imputer."
     )
     print("[+] BiGRUHistoryImputer class unification test PASSED.")
 
